@@ -1,0 +1,7 @@
+{
+  "group_patterns": [
+    "*某某群*"
+  ],
+  "ai_api_url": "https://api.deepseek.com/chat/completions",
+  "ai_api_key": ""
+}
