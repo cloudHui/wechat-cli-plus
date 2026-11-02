@@ -6,7 +6,15 @@ import sys
 
 def output_json(data, file=None):
     file = file or sys.stdout
-    json.dump(data, file, ensure_ascii=False, indent=2)
+    if hasattr(file, 'reconfigure'):
+        try:
+            file.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+    try:
+        json.dump(data, file, ensure_ascii=False, indent=2)
+    except UnicodeEncodeError:
+        json.dump(data, file, ensure_ascii=True, indent=2)
     file.write('\n')
 
 

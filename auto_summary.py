@@ -105,21 +105,54 @@ def get_target_sessions():
     return target_sessions
 
 
-def fetch_new_messages(chat_name: str, last_ts: int):
-    """获取指定群在上一次同步时间之后的增量消息"""
-    args = ["history", chat_name, "--limit", "100", "--format", "json", "--media"]
+def fetch_new_messages(chat_name: str, last_ts: int) -> list:
+    """分批循环拉取上一次同步时间之后的全部增量消息，直到完全取完（零截断、零遗漏）"""
+    all_batches = []
+    batch_size = 200
+    offset = 0
+
     if last_ts > 0:
         start_time_str = datetime.fromtimestamp(last_ts + 1).strftime("%Y-%m-%d %H:%M:%S")
-        args.extend(["--start-time", start_time_str])
+    else:
+        today_start = datetime.now().strftime("%Y-%m-%d 00:00:00")
+        start_time_str = today_start
 
-    raw_json = run_cli_command(args)
-    if not raw_json:
+    while True:
+        args = [
+            "history", chat_name,
+            "--limit", str(batch_size),
+            "--offset", str(offset),
+            "--format", "json",
+            "--media",
+            "--start-time", start_time_str
+        ]
+
+        raw_json = run_cli_command(args)
+        if not raw_json:
+            break
+        try:
+            data = json.loads(raw_json)
+            msgs = data.get("messages", [])
+            if not msgs:
+                break
+            all_batches.append(msgs)
+            if len(msgs) < batch_size:
+                # 抓取数量小于单批容量，说明已完全取尽
+                break
+            offset += len(msgs)
+            print(f"   [分批拉取] 已累计拉取 {offset} 条，继续拉取下一批...", flush=True)
+        except Exception:
+            break
+
+    if not all_batches:
         return []
-    try:
-        data = json.loads(raw_json)
-        return data.get("messages", [])
-    except Exception:
-        return []
+
+    # history 批次从前往后是按最新倒序拉取的，反转各批次后拼接恢复从早到晚的时间正序
+    all_messages = []
+    for b in reversed(all_batches):
+        all_messages.extend(b)
+
+    return all_messages
 
 
 def clean_messages(raw_messages: list) -> list:
@@ -173,7 +206,7 @@ def call_llm_api(chat_name: str, messages: list) -> str:
         f"2. 📌【关键信息与待办/预警】：有什么重要的注意事项、资费变动、待办节点或操作避坑？\n"
         f"3. 🔗【分享的资料/链接/图片】：若有分享群资料或图片，列出要点（若无则写“无”）。\n\n"
         f"聊天记录如下：\n"
-        + "\n".join(messages[-80:])  # 限制近 80 条有效发言避免上下文超限
+        + "\n".join(messages)
     )
 
     # 1. 如果是 Google Gemini 官方 API (包含 generativelanguage.googleapis.com)
@@ -244,7 +277,7 @@ def call_agy_cli(chat_name: str, messages: list) -> tuple:
         f"2. 📌【关键信息与待办预警】：有什么重要的注意事项、资费变动、待办节点或避坑提醒？\n"
         f"3. 🔗【分享的资料/链接/图片】：若有分享群资料或图片，列出要点（若无则写“无”）。\n\n"
         f"聊天记录如下：\n"
-        + "\n".join(messages[-80:])
+        + "\n".join(messages)
     )
 
     print(f"⏳ 正在调用官方 agy CLI 提炼总结 (调用大模型约需 5~15 秒，请稍候)...", flush=True)
@@ -311,7 +344,7 @@ def call_antigravity_cli(chat_name: str, messages: list) -> str:
         f"2. 📌【关键信息与待办预警】：有什么重要的注意事项、资费变动、待办节点或避坑提醒？\n"
         f"3. 🔗【分享的资料/链接/图片】：若有分享群资料或图片，列出要点（若无则写“无”）。\n\n"
         f"聊天记录如下：\n"
-        + "\n".join(messages[-80:])
+        + "\n".join(messages)
     )
 
     cmd = [exe_path, "agentapi", "new-conversation", "--model=flash", f"--title=微信总结:{chat_name}", prompt]
@@ -345,8 +378,8 @@ def call_antigravity_cli(chat_name: str, messages: list) -> str:
     return None
 
 
-def summarize_text(chat_name: str, messages: list) -> str:
-    """智能多级总结：1. 官方 agy CLI -> 2. 本地 Antigravity 引擎 -> 3. 外部 API Key -> 4. 本地脱敏清洗"""
+def _summarize_single_chunk(chat_name: str, messages: list) -> str:
+    """对单批次消息进行智能多级总结：1. 官方 agy CLI -> 2. 本地 Antigravity 引擎 -> 3. 外部 API Key -> 4. 本地脱敏清洗"""
     if not messages:
         return "无新消息。"
 
@@ -407,6 +440,28 @@ def summarize_text(chat_name: str, messages: list) -> str:
         res.append(f"• 图片分享：共 {images} 张")
 
     return "\n".join(res)
+
+
+def summarize_text(chat_name: str, messages: list) -> str:
+    """智能增量总结入口：当消息量极大时自动分批送入大模型，保证完全取完并深度总结"""
+    if not messages:
+        return "无新消息。"
+
+    CHUNK_SIZE = 300
+    if len(messages) <= CHUNK_SIZE:
+        return _summarize_single_chunk(chat_name, messages)
+
+    # 超过 300 条发言时自动切批，分批深度提炼
+    total_chunks = (len(messages) + CHUNK_SIZE - 1) // CHUNK_SIZE
+    print(f"📦 本次捕获增量发言共 {len(messages)} 条，自动切分为 {total_chunks} 批进行全量深度总结...", flush=True)
+    summaries = []
+    for idx in range(total_chunks):
+        chunk = messages[idx * CHUNK_SIZE : (idx + 1) * CHUNK_SIZE]
+        print(f"   ⏳ 正在提炼第 {idx + 1}/{total_chunks} 批 (第 {idx * CHUNK_SIZE + 1}~{min((idx + 1) * CHUNK_SIZE, len(messages))} 条)...", flush=True)
+        res = _summarize_single_chunk(f"{chat_name} (第{idx+1}批)", chunk)
+        summaries.append(f"#### 📑 第 {idx + 1}/{total_chunks} 批提炼总结 (含 {len(chunk)} 条发言):\n\n{res}")
+
+    return "\n\n---\n\n".join(summaries)
 
 
 def append_to_doc(chat_name: str, summary_content: str, msg_count: int) -> str:
@@ -472,7 +527,7 @@ def main():
             continue
 
         # 生成总结
-        print(f"正在分析总结【{chat_name}】的 {len(msgs)} 条发言...")
+        print(f"正在全量分析总结【{chat_name}】的全部 {len(msgs)} 条发言 (不设截断，完整送入 AI)...")
         summary = summarize_text(chat_name, msgs)
 
         # 1. 终端高亮直接打印
