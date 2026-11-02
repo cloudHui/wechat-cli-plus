@@ -13,14 +13,24 @@ import subprocess
 from datetime import datetime
 from fnmatch import fnmatch
 
-# 彻底修复 Windows 中文与特殊 Emoji 乱码和编码崩溃
+# 彻底修复 Windows 中文与特殊 Emoji 乱码和编码崩溃，安全兼容 pythonw 无窗口环境
 if os.name == 'nt':
     os.system('chcp 65001 >nul 2>&1')
-sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-sys.stdin.reconfigure(encoding='utf-8', errors='replace')
+if sys.stdout is not None and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if sys.stdin is not None and hasattr(sys.stdin, 'reconfigure'):
+    sys.stdin.reconfigure(encoding='utf-8', errors='replace')
 
-# 根目录与路径定义
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 根目录与路径定义（自适应源码与 Nuitka 二进制编译模式）
+def get_base_dir() -> str:
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    if "__compiled__" in globals():
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+BASE_DIR = get_base_dir()
 STATE_FILE = os.path.join(BASE_DIR, "last_sync.json")
 OUTPUT_DIR = os.path.join(BASE_DIR, "summaries")
 CONFIG_FILE = os.path.join(BASE_DIR, "user_config.json")
@@ -73,14 +83,29 @@ def save_state(state: dict):
 
 
 def run_cli_command(args: list) -> str:
-    """调用 wechat-cli entry.py 获取 JSON 数据"""
-    cmd = [PYTHON_EXEC, ENTRY_SCRIPT] + args
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-    res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
-    if res.returncode != 0:
-        return ""
-    return res.stdout.strip()
+    """调用 wechat-cli 获取 JSON 数据，优先内存调用以支持 Nuitka 编译与免子进程极速执行"""
+    try:
+        from click.testing import CliRunner
+        from wechat_cli.main import cli as wechat_cli_app
+        runner = CliRunner()
+        res = runner.invoke(wechat_cli_app, args)
+        if res.exit_code == 0 and res.output:
+            return res.output.strip()
+    except Exception:
+        pass
+
+    # 回退方式：通过 entry.py 子进程调用
+    if os.path.exists(ENTRY_SCRIPT):
+        cmd = [PYTHON_EXEC, ENTRY_SCRIPT] + args
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
+            if res.returncode == 0:
+                return res.stdout.strip()
+        except Exception:
+            pass
+    return ""
 
 
 def get_target_sessions():
@@ -484,90 +509,151 @@ def append_to_doc(chat_name: str, summary_content: str, msg_count: int) -> str:
     return daily_doc
 
 
-def main():
-    print("=" * 60)
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 微信增量消息总结检测启动...")
-    print(f"目标监控规则: {GROUP_PATTERNS}")
+def ask_save_choice(prompt_str: str) -> bool:
+    """单键极速响应：按 y/Y 确认保存，按任意其他键立即取消跳过（无需按回车确认）"""
+    print(prompt_str, end="", flush=True)
+    if os.name == 'nt':
+        try:
+            import msvcrt
+            ch = msvcrt.getch()
+            # 过滤 Windows 扩展键（方向键、功能键等 0x00 / 0xe0 前缀）
+            if ch in (b'\x00', b'\xe0'):
+                msvcrt.getch()
+                print()
+                return False
+            if ch == b'\x03':  # Ctrl+C
+                print("\n[退出]")
+                sys.exit(0)
+            char = ch.decode('utf-8', errors='ignore')
+            if char in ('y', 'Y'):
+                print(char)
+                return True
+            else:
+                print()
+                return False
+        except Exception:
+            pass
+
+    # 非 Windows 或重定向管道时降级使用标准输入
+    try:
+        choice = input().strip()
+        return choice.lower() in ("y", "yes")
+    except Exception:
+        return False
+
+
+def run_incremental_summary(log_fn=print, ask_save_fn=None, auto_save=None) -> dict:
+    """增量总结执行引擎：可被控制台与 GUI 界面通用调用"""
+    # 动态重新读取一次最新配置
+    global GROUP_PATTERNS, AI_API_URL, AI_API_KEY
+    GROUP_PATTERNS, AI_API_URL, AI_API_KEY = load_user_config()
+
+    log_fn("=" * 60)
+    log_fn(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 微信增量消息总结检测启动...")
+    log_fn(f"目标监控规则: {GROUP_PATTERNS}")
     if get_agy_path():
-        print("AI 模型引擎: 官方 agy CLI (Gemini Flash，本地免 Key 驱动)")
+        log_fn("AI 模型引擎: 官方 agy CLI (Gemini Flash，本地免 Key 驱动)")
     elif get_antigravity_exe():
-        print("AI 模型引擎: 本地 Antigravity 引擎 (Gemini Flash，本地免 Key 驱动)")
+        log_fn("AI 模型引擎: 本地 Antigravity 引擎 (Gemini Flash，本地免 Key 驱动)")
     elif AI_API_KEY:
-        print(f"AI 模型引擎: 已启用外部 API ({AI_API_URL})")
+        log_fn(f"AI 模型引擎: 已启用外部 API ({AI_API_URL})")
     else:
-        print("AI 模型引擎: 本地离线清洗 (未配置 Key 与 CLI)")
-    print("=" * 60)
+        log_fn("AI 模型引擎: 本地离线清洗 (未配置 Key 与 CLI)")
+    log_fn("=" * 60)
 
     state = load_state()
     target_sessions = get_target_sessions()
 
     if not target_sessions:
-        print("未发现匹配的目标群聊，请确认群聊名称是否匹配规则。")
-        return
+        log_fn("未发现匹配的目标群聊，请确认群聊名称是否匹配规则。")
+        return {"results": [], "saved_doc": None}
 
-    processed_any = False
-    saved_any = False
-
+    # 1. 先筛选出哪些目标群有新增发言
+    sessions_to_process = []
     for s in target_sessions:
         chat_name = s.get("chat", "")
         current_ts = s.get("timestamp", 0)
         last_ts = state.get(chat_name, 0)
+        if current_ts > last_ts:
+            sessions_to_process.append(s)
+        else:
+            log_fn(f"[跳过] 【{chat_name}】暂无新发言 (当前时间戳已同步)")
 
-        # 比对时间戳：无新消息则跳过
-        if current_ts <= last_ts:
-            print(f"[跳过] 【{chat_name}】暂无新发言 (当前时间戳已同步)")
-            continue
+    if not sessions_to_process:
+        log_fn("\n🏁 检测完成，所有目标群均无新增内容。")
+        return {"results": [], "saved_doc": None}
 
-        print(f"\n⚡ 检测到新消息！正在拉取【{chat_name}】增量记录...")
+    total_count = len(sessions_to_process)
+    log_fn(f"\n📢 检测到 {total_count} 个群聊有新增发言，开始全量总结...\n")
+
+    summarized_results = []
+
+    # 2. 连续提炼所有群的总结并输出，不再中途打断
+    for idx, s in enumerate(sessions_to_process, 1):
+        chat_name = s.get("chat", "")
+        current_ts = s.get("timestamp", 0)
+        last_ts = state.get(chat_name, 0)
+
+        log_fn(f"\n⚡ [{idx}/{total_count}] 正在拉取【{chat_name}】增量记录...")
         raw_msgs = fetch_new_messages(chat_name, last_ts)
         msgs = clean_messages(raw_msgs)
 
         if not msgs:
-            print(f"[提示] 【{chat_name}】无有效文本发言 (全部为撤回或纯表情)")
+            log_fn(f"[提示] 【{chat_name}】无有效文本发言 (全部为撤回或纯表情)")
             state[chat_name] = current_ts
             continue
 
-        # 生成总结
-        print(f"正在全量分析总结【{chat_name}】的全部 {len(msgs)} 条发言 (不设截断，完整送入 AI)...")
+        log_fn(f"正在全量分析总结【{chat_name}】的全部 {len(msgs)} 条发言 (不设截断，完整送入 AI)...")
         summary = summarize_text(chat_name, msgs)
 
-        # 1. 终端高亮直接打印
-        print("\n" + "-" * 50)
-        print(f"📌 【{chat_name}】重点总结 (新增 {len(msgs)} 条):")
-        print("-" * 50)
-        print(summary)
-        print("-" * 50)
+        # 终端高亮展示每个群的总结
+        log_fn("\n" + "-" * 50)
+        log_fn(f"📌 [{idx}/{total_count}] 【{chat_name}】重点总结 (新增 {len(msgs)} 条):")
+        log_fn("-" * 50)
+        log_fn(summary)
+        log_fn("-" * 50)
 
-        # 2. 交互选择是否写入归档文档 (默认不记录，直接回车跳过)
+        summarized_results.append({
+            "chat_name": chat_name,
+            "summary": summary,
+            "count": len(msgs)
+        })
+        state[chat_name] = current_ts
+
+    saved_doc = None
+    # 3. 全部群总结完成后，统一决定是否写入今日归档文档
+    if summarized_results:
+        log_fn("\n" + "=" * 60)
+        group_names = "、".join([f"【{item['chat_name']}】" for item in summarized_results])
+        log_fn(f"🎉 本次共完成 {len(summarized_results)} 个群聊的总结：{group_names}")
+
         save_to_doc = False
-        try:
-            choice = input("\n💾 是否将上述总结记录到今日文档？[y/N] (直接回车默认不记录): ").strip().lower()
-            if choice in ("y", "yes"):
-                save_to_doc = True
-        except Exception:
-            save_to_doc = False
+        if auto_save is not None:
+            save_to_doc = bool(auto_save)
+        elif ask_save_fn:
+            save_to_doc = ask_save_fn(len(summarized_results), group_names)
+        else:
+            prompt_str = f"\n💾 是否将上述 {len(summarized_results)} 个群聊的总结统一记录到今日文档？[按 y 保存 / 任意其他键取消]: "
+            save_to_doc = ask_save_choice(prompt_str)
 
         if save_to_doc:
-            saved_doc = append_to_doc(chat_name, summary, len(msgs))
-            print(f"✅ 已记录保存至：{saved_doc}")
-            saved_any = True
+            for item in summarized_results:
+                saved_doc = append_to_doc(item["chat_name"], item["summary"], item["count"])
+            log_fn(f"✅ 已全部保存至今日文档：{saved_doc}")
+            log_fn(f"\n✅ 增量总结完毕，已保存内容见今日文档：{saved_doc}")
         else:
-            print("⏭️ 已跳过文档记录（仅屏幕展示）。")
-
-        # 3. 更新同步时间戳
-        state[chat_name] = current_ts
-        processed_any = True
-
-    # 保存最新状态
-    save_state(state)
-
-    if processed_any:
-        if saved_any:
-            print(f"\n✅ 增量总结完毕，已保存内容见今日文档：{get_today_doc_path()}")
-        else:
-            print("\n✅ 增量总结完毕（本次未保存到本地文档）。")
+            log_fn("⏭️ 已跳过文档记录（仅屏幕展示）。")
+            log_fn("\n✅ 增量总结完毕（本次未保存到本地文档）。")
     else:
-        print("\n🏁 检测完成，所有目标群均无新增内容。")
+        log_fn("\n🏁 检测完成，无有效发言内容可生成总结。")
+
+    # 4. 保存最新同步状态
+    save_state(state)
+    return {"results": summarized_results, "saved_doc": saved_doc}
+
+
+def main():
+    run_incremental_summary(log_fn=print, ask_save_fn=None, auto_save=None)
 
 
 if __name__ == "__main__":

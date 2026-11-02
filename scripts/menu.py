@@ -14,8 +14,10 @@ import shutil
 # 彻底修复 Windows 中文与特殊 Emoji 乱码和编码崩溃
 if os.name == 'nt':
     os.system('chcp 65001 >nul 2>&1')
-sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-sys.stdin.reconfigure(encoding='utf-8', errors='replace')
+if sys.stdout is not None and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if sys.stdin is not None and hasattr(sys.stdin, 'reconfigure'):
+    sys.stdin.reconfigure(encoding='utf-8', errors='replace')
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PYTHON_EXEC = sys.executable
