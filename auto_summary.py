@@ -280,9 +280,9 @@ def call_agy_cli(chat_name: str, messages: list) -> tuple:
         + "\n".join(messages)
     )
 
-    print(f"⏳ 正在调用官方 agy CLI 提炼总结 (调用大模型约需 5~15 秒，请稍候)...", flush=True)
+    print(f"⏳ 正在调用官方 agy CLI (Gemini 3.8 Flash) 提炼总结 (约需 3~10 秒，请稍候)...", flush=True)
     try:
-        cmd = [agy_path, "-p", prompt]
+        cmd = [agy_path, "--model", "gemini-3.8-flash-high", "-p", prompt]
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         res = subprocess.run(cmd, capture_output=True, env=env, timeout=60)
@@ -506,6 +506,7 @@ def main():
         return
 
     processed_any = False
+    saved_any = False
 
     for s in target_sessions:
         chat_name = s.get("chat", "")
@@ -537,8 +538,21 @@ def main():
         print(summary)
         print("-" * 50)
 
-        # 2. 写入按小时归档文档
-        append_to_doc(chat_name, summary, len(msgs))
+        # 2. 交互选择是否写入归档文档 (默认不记录，直接回车跳过)
+        save_to_doc = False
+        try:
+            choice = input("\n💾 是否将上述总结记录到今日文档？[y/N] (直接回车默认不记录): ").strip().lower()
+            if choice in ("y", "yes"):
+                save_to_doc = True
+        except Exception:
+            save_to_doc = False
+
+        if save_to_doc:
+            saved_doc = append_to_doc(chat_name, summary, len(msgs))
+            print(f"✅ 已记录保存至：{saved_doc}")
+            saved_any = True
+        else:
+            print("⏭️ 已跳过文档记录（仅屏幕展示）。")
 
         # 3. 更新同步时间戳
         state[chat_name] = current_ts
@@ -548,7 +562,10 @@ def main():
     save_state(state)
 
     if processed_any:
-        print(f"\n✅ 增量总结完毕，已同步追加到今日文档：{get_today_doc_path()}")
+        if saved_any:
+            print(f"\n✅ 增量总结完毕，已保存内容见今日文档：{get_today_doc_path()}")
+        else:
+            print("\n✅ 增量总结完毕（本次未保存到本地文档）。")
     else:
         print("\n🏁 检测完成，所有目标群均无新增内容。")
 
