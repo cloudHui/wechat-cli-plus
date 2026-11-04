@@ -22,7 +22,6 @@ import queue
 import threading
 import datetime
 import subprocess
-from fnmatch import fnmatch
 
 # 彻底修复 Windows 编码与任务栏独立图标绑定
 if os.name == 'nt':
@@ -39,30 +38,25 @@ if hasattr(sys.stdout, 'reconfigure'):
 if hasattr(sys.stdin, 'reconfigure'):
     sys.stdin.reconfigure(encoding='utf-8', errors='replace')
 
-# 动态获取根目录（兼容源码运行与 Nuitka 编译后的独立二进制）
-def get_base_dir() -> str:
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
-    if "__compiled__" in globals():
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
-
-
-BASE_DIR = get_base_dir()
-CONFIG_FILE = os.path.join(BASE_DIR, "user_config.json")
-SUMMARIES_DIR = os.path.join(BASE_DIR, "summaries")
-LAST_SYNC_FILE = os.path.join(BASE_DIR, "last_sync.json")
-
-# 引入核心业务逻辑
+# 引入核心业务逻辑、配置路径与辅助工具
 from auto_summary import (
+    BASE_DIR,
+    CONFIG_FILE,
+    OUTPUT_DIR as SUMMARIES_DIR,
+    STATE_FILE as LAST_SYNC_FILE,
     run_incremental_summary,
     load_user_config,
+    load_full_config,
+    save_full_config,
     get_today_doc_path,
     get_agy_path,
     get_antigravity_exe,
+    get_ai_engine_desc,
     run_cli_command,
     load_state,
-    save_state
+    save_state,
+    get_subprocess_flags,
+    get_stored_keys
 )
 
 try:
@@ -77,18 +71,43 @@ except ImportError:
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
+# 字体栈定义：优先微软正黑/微软雅黑UI，字形优雅清晰饱满；技术日志采用 Consolas
+FONT_FAMILY_MAIN = "Microsoft YaHei UI"
+FONT_FAMILY_MONO = "Consolas"
+
+
+def safe_textbox_append(textbox: ctk.CTkTextbox, text: str):
+    """向文本框追加文本并严格锁定视口，绝不自动滑到底部（保持用户当前正在看的位置）"""
+    raw = textbox._textbox
+    try:
+        top_index = raw.index("@0,0")
+    except Exception:
+        top_index = "1.0"
+
+    textbox.insert("end", text)
+
+    try:
+        raw.see(top_index)
+    except Exception:
+        pass
+
 
 class WeChatAssistantApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
         self.title("微信 AI 增量总结助手")
-        self.geometry("1020x680")
-        self.minsize(920, 600)
+        self.geometry("1040x700")
+        self.minsize(940, 620)
 
-        # 线程通信与状态
+        # 线程通信队列与全局状态
         self.log_queue = queue.Queue()
+        self.result_queue = queue.Queue()
         self.is_running = False
+        self.key_count = 0
+        self.keys_drawer_visible = False
+        self.configured_groups = []
+        self.cached_wechat_groups = []
 
         # 设置专属窗口与任务栏图标
         self.icon_path = os.path.join(BASE_DIR, "app.ico")
@@ -101,24 +120,20 @@ class WeChatAssistantApp(ctk.CTk):
         self._build_sidebar()
         self._build_views()
 
-        # 默认选中第一个视图
+        # 默认选中第一个视图并开启队列消费者
         self.select_view("summary")
-        self.after(100, self._process_log_queue)
+        self.after(100, self._process_queues)
 
     def _set_app_icon(self):
-        if hasattr(self, 'icon_path') and os.path.exists(self.icon_path):
+        """设置专属窗口与任务栏图标"""
+        def _apply():
             try:
-                self.iconbitmap(self.icon_path)
+                if hasattr(self, 'icon_path') and os.path.exists(self.icon_path):
+                    self.iconbitmap(self.icon_path)
             except Exception:
                 pass
-            self.after(150, self._apply_icon_safe)
-
-    def _apply_icon_safe(self):
-        try:
-            if hasattr(self, 'icon_path') and os.path.exists(self.icon_path):
-                self.iconbitmap(self.icon_path)
-        except Exception:
-            pass
+        _apply()
+        self.after(150, _apply)
 
     def _build_sidebar(self):
         self.sidebar_frame = ctk.CTkFrame(self, width=190, corner_radius=0)
@@ -203,52 +218,187 @@ class WeChatAssistantApp(ctk.CTk):
                 frame.grid_forget()
 
     # =========================================================================
-    # 视图 1：增量总结
+    # 视图 1：增量总结 (主视图)
     # =========================================================================
     def _create_summary_view(self):
+        """构建增量总结主视图：包含状态栏、密钥抽屉、操作栏、动态进度及成果/日志双标签页"""
         frame = ctk.CTkFrame(self, fg_color="transparent")
         frame.grid_columnconfigure(0, weight=1)
-        frame.grid_rowconfigure(2, weight=1)
+        frame.grid_rowconfigure(4, weight=1)
 
-        # 顶部状态卡片
-        status_card = ctk.CTkFrame(frame, corner_radius=10)
-        status_card.grid(row=0, column=0, sticky="ew", pady=(0, 10), padx=5)
-        status_card.grid_columnconfigure((0, 1, 2), weight=1)
+        # 1. 顶部状态卡片 (row 0)
+        self._build_top_status_card(frame)
+
+        # 2. 密钥展开抽屉 (row 1, 初始隐藏)
+        self._build_keys_drawer(frame)
+
+        # 3. 操作工具栏 (row 2)
+        self._build_action_bar(frame)
+
+        # 4. 实时动态状态条 (row 3)
+        self.lbl_live_status = ctk.CTkLabel(
+            frame,
+            text="💡 提示：点击「立即执行增量总结」提炼群聊要点",
+            font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=13),
+            text_color=("gray40", "gray70"),
+            anchor="w"
+        )
+        self.lbl_live_status.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 6))
+
+        # 5. 分离的选项卡输出区：AI 总结成果 + 运行过程日志 (row 4)
+        self._build_output_tabs(frame)
+
+        def on_show():
+            self._refresh_summary_status()
+        frame.on_show = on_show
+        return frame
+
+    def _build_top_status_card(self, parent):
+        """顶部状态摘要卡片"""
+        card = ctk.CTkFrame(parent, corner_radius=10)
+        card.grid(row=0, column=0, sticky="ew", pady=(0, 8), padx=5)
+        card.grid_columnconfigure((0, 1, 2), weight=1)
 
         self.lbl_monitored_groups = ctk.CTkLabel(
-            status_card, text="当前监控: 加载中...", font=ctk.CTkFont(size=13, weight="bold")
+            card, text="当前监控: 加载中...", font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=13, weight="bold")
         )
         self.lbl_monitored_groups.grid(row=0, column=0, padx=15, pady=10, sticky="w")
 
         self.lbl_ai_engine = ctk.CTkLabel(
-            status_card, text="AI 引擎: 加载中...", font=ctk.CTkFont(size=13)
+            card, text="AI 引擎: 加载中...", font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=13)
         )
         self.lbl_ai_engine.grid(row=0, column=1, padx=15, pady=10, sticky="w")
 
-        self.lbl_key_status = ctk.CTkLabel(
-            status_card, text="密钥: 检查中...", font=ctk.CTkFont(size=13)
+        self.btn_key_status = ctk.CTkButton(
+            card,
+            text="🔑 密钥就绪 (16个) ▾",
+            font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=13, weight="bold"),
+            fg_color="transparent",
+            hover_color=("gray80", "gray25"),
+            text_color=("green", "lightgreen"),
+            width=140,
+            height=28,
+            cursor="hand2",
+            command=self._toggle_keys_drawer
         )
-        self.lbl_key_status.grid(row=0, column=2, padx=15, pady=10, sticky="e")
+        self.btn_key_status.grid(row=0, column=2, padx=15, pady=8, sticky="e")
 
-        # 操作工具栏
-        action_bar = ctk.CTkFrame(frame, fg_color="transparent")
-        action_bar.grid(row=1, column=0, sticky="ew", pady=(0, 10), padx=5)
+    def _build_keys_drawer(self, parent):
+        """一键展开/收起的 16 个微信 SQLite 数据库密钥抽屉面板"""
+        self.keys_drawer = ctk.CTkFrame(parent, corner_radius=10, fg_color=("gray90", "#1E222A"))
+        self.keys_drawer_visible = False
+
+        top_row = ctk.CTkFrame(self.keys_drawer, fg_color="transparent")
+        top_row.pack(fill="x", padx=15, pady=(10, 5))
+
+        title = ctk.CTkLabel(
+            top_row,
+            text="🔑 微信 SQLite 数据库密钥列表 (已提取就绪，全只读模式)",
+            font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=13, weight="bold")
+        )
+        title.pack(side="left")
+
+        btn_close = ctk.CTkButton(
+            top_row,
+            text="✕ 收起",
+            width=65,
+            height=24,
+            fg_color=("gray75", "gray30"),
+            command=self._toggle_keys_drawer
+        )
+        btn_close.pack(side="right")
+
+        self.scroll_keys_list = ctk.CTkScrollableFrame(self.keys_drawer, height=170, corner_radius=8)
+        self.scroll_keys_list.pack(fill="both", expand=True, padx=10, pady=(5, 10))
+
+    def _toggle_keys_drawer(self):
+        """切换密钥面板的展开与收起状态"""
+        if self.keys_drawer_visible:
+            self.keys_drawer.grid_forget()
+            self.keys_drawer_visible = False
+            self.btn_key_status.configure(text=f"🔑 密钥就绪 ({self.key_count}个) ▾")
+        else:
+            self.keys_drawer.grid(row=1, column=0, sticky="ew", pady=(0, 10), padx=5)
+            self.keys_drawer_visible = True
+            self.btn_key_status.configure(text=f"🔑 密钥就绪 ({self.key_count}个) ▴")
+            self._render_keys_drawer_items()
+
+    def _render_keys_drawer_items(self):
+        """渲染抽屉内的 16 个密钥详情项"""
+        for w in self.scroll_keys_list.winfo_children():
+            w.destroy()
+
+        data = get_stored_keys()
+        if not data:
+            ctk.CTkLabel(self.scroll_keys_list, text="⚠️ 未找到密钥文件，请在左侧「密钥管理」中点击提取。").pack(pady=15)
+            return
+
+        for db_rel, info in data.items():
+            self._build_key_item_row(db_rel, info)
+
+    def _build_key_item_row(self, db_rel: str, info: dict):
+        """构建单个数据库密钥条目行"""
+        row = ctk.CTkFrame(self.scroll_keys_list, fg_color="transparent")
+        row.pack(fill="x", pady=2, padx=5)
+
+        size_mb = info.get("size_mb", 0.0)
+        enc_key = info.get("enc_key", "")
+        masked = f"{enc_key[:8]}...{enc_key[-8:]}" if len(enc_key) > 16 else enc_key
+
+        ctk.CTkLabel(
+            row,
+            text=f"📄 {db_rel} ({size_mb} MB)",
+            font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=12, weight="bold"),
+            width=240,
+            anchor="w"
+        ).pack(side="left")
+
+        ctk.CTkLabel(
+            row,
+            text=masked,
+            font=ctk.CTkFont(family=FONT_FAMILY_MONO, size=12),
+            text_color="gray",
+            width=210,
+            anchor="w"
+        ).pack(side="left", padx=10)
+
+        ctk.CTkButton(
+            row,
+            text="📋 复制Key",
+            width=75,
+            height=24,
+            command=lambda k=enc_key, n=db_rel: self._copy_key_to_clipboard(k, n)
+        ).pack(side="right", padx=5)
+
+    def _copy_key_to_clipboard(self, key_str: str, db_name: str):
+        """复制指定数据库的密钥到剪贴板"""
+        self.clipboard_clear()
+        self.clipboard_append(key_str)
+        messagebox.showinfo("已复制", f"已成功复制【{db_name}】的 64 位数据库密钥！")
+
+    def _build_action_bar(self, parent):
+        """顶部操作工具栏：增量总结触发、默认不自动写入文档开关、打开文档"""
+        action_bar = ctk.CTkFrame(parent, fg_color="transparent")
+        action_bar.grid(row=2, column=0, sticky="ew", pady=(0, 8), padx=5)
 
         self.btn_run_summary = ctk.CTkButton(
             action_bar,
             text="🚀 立即执行增量总结",
             height=36,
-            font=ctk.CTkFont(size=14, weight="bold"),
+            font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=14, weight="bold"),
             command=self._start_summary_task
         )
         self.btn_run_summary.pack(side="left", padx=(0, 12))
 
-        self.auto_save_var = ctk.BooleanVar(value=True)
+        # 读取配置，默认不自动写入文档（False）
+        cfg = load_full_config()
+        self.auto_save_var = ctk.BooleanVar(value=cfg.get("auto_save_to_doc", False))
         self.switch_auto_save = ctk.CTkSwitch(
             action_bar,
             text="自动写入今日归档文档",
             variable=self.auto_save_var,
-            font=ctk.CTkFont(size=13)
+            font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=13),
+            command=self._on_auto_save_toggled
         )
         self.switch_auto_save.pack(side="left", padx=10)
 
@@ -262,75 +412,168 @@ class WeChatAssistantApp(ctk.CTk):
         )
         self.btn_open_today.pack(side="right", padx=(10, 0))
 
-        self.btn_clear_log = ctk.CTkButton(
-            action_bar,
-            text="🧹 清空日志",
-            width=90,
-            height=36,
-            fg_color=("gray70", "gray30"),
-            command=self._clear_summary_log
-        )
-        self.btn_clear_log.pack(side="right", padx=(10, 0))
+    def _on_auto_save_toggled(self):
+        """持久化记忆自动写入今日文档的偏好设置"""
+        cfg = load_full_config()
+        cfg["auto_save_to_doc"] = self.auto_save_var.get()
+        save_full_config(cfg)
 
-        # 日志输出文本框
+    def _build_output_tabs(self, parent):
+        """构建分离的选项卡：Tab 1 总结成果，Tab 2 运行过程日志"""
+        self.output_tabview = ctk.CTkTabview(parent, corner_radius=10)
+        self.output_tabview.grid(row=4, column=0, sticky="nsew", padx=5, pady=(0, 5))
+
+        tab_results = self.output_tabview.add("✨ AI 总结成果")
+        tab_logs = self.output_tabview.add("📋 运行过程日志")
+        self.output_tabview.set("✨ AI 总结成果")
+
+        self._build_results_tab(tab_results)
+        self._build_logs_tab(tab_logs)
+
+    def _build_results_tab(self, tab):
+        """构建 AI 总结成果展示选项卡 (排版舒适、大号微软雅黑)"""
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+
+        bar = ctk.CTkFrame(tab, fg_color="transparent")
+        bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+
+        ctk.CTkLabel(
+            bar, text="📑 提炼成果展示 (已剔除杂音与底层日志，专心阅读重点)",
+            font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=12), text_color="gray"
+        ).pack(side="left")
+
+        ctk.CTkButton(
+            bar, text="📋 复制全部总结", width=110, height=28,
+            fg_color=("gray75", "gray30"), command=self._copy_summary_results
+        ).pack(side="right", padx=(6, 0))
+
+        ctk.CTkButton(
+            bar, text="🧹 清空成果", width=85, height=28,
+            fg_color=("gray75", "gray30"), command=self._clear_summary_results
+        ).pack(side="right")
+
+        self.txt_summary_result = ctk.CTkTextbox(
+            tab, corner_radius=8, font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=14),
+            wrap="word", text_color=("gray10", "#F1F5F9")
+        )
+        self.txt_summary_result.grid(row=1, column=0, sticky="nsew")
+
+    def _build_logs_tab(self, tab):
+        """构建运行过程日志选项卡 (等宽 Consolas 技术日志)"""
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+
+        bar = ctk.CTkFrame(tab, fg_color="transparent")
+        bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+
+        ctk.CTkLabel(
+            bar, text="🔍 技术运行日志 (包含消息抓取、跳过原因、时间戳对齐与报错)",
+            font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=12), text_color="gray"
+        ).pack(side="left")
+
+        ctk.CTkButton(
+            bar, text="🧹 清空日志", width=85, height=28,
+            fg_color=("gray75", "gray30"), command=self._clear_summary_log
+        ).pack(side="right")
+
         self.txt_summary_log = ctk.CTkTextbox(
-            frame,
-            corner_radius=10,
-            font=ctk.CTkFont(family="Consolas", size=13),
+            tab, corner_radius=8, font=ctk.CTkFont(family=FONT_FAMILY_MONO, size=12),
             wrap="word"
         )
-        self.txt_summary_log.grid(row=2, column=0, sticky="nsew", padx=5, pady=5)
+        self.txt_summary_log.grid(row=1, column=0, sticky="nsew")
 
-        def on_show():
-            self._refresh_summary_status()
-        frame.on_show = on_show
+    def _copy_summary_results(self):
+        """一键复制 AI 总结全部成果到剪贴板"""
+        content = self.txt_summary_result.get("1.0", "end").strip()
+        if not content:
+            messagebox.showinfo("提示", "当前暂无总结成果可复制。")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(content)
+        messagebox.showinfo("成功", "已将全部 AI 总结成果复制到剪贴板！")
 
-        return frame
-
-    def _refresh_summary_status(self):
-        patterns, url, key = load_user_config()
-        self.lbl_monitored_groups.configure(text=f"🎯 监控规则: {', '.join(patterns)}")
-
-        if get_agy_path():
-            engine_desc = "官方 agy CLI (Gemini Flash 本地免Key)"
-        elif get_antigravity_exe():
-            engine_desc = "本地 Antigravity 引擎 (Gemini Flash)"
-        elif key:
-            engine_desc = f"外部 API ({url[:20]}...)"
-        else:
-            engine_desc = "本地离线纯净过滤模式"
-        self.lbl_ai_engine.configure(text=f"🤖 AI 引擎: {engine_desc}")
-
-        keys_file = os.path.expanduser("~/.wechat-cli/all_keys.json")
-        if os.path.exists(keys_file):
-            try:
-                with open(keys_file, "r", encoding="utf-8") as f:
-                    kc = len(json.load(f))
-                self.lbl_key_status.configure(text=f"🔑 密钥就绪 ({kc}个)", text_color=("green", "lightgreen"))
-            except Exception:
-                self.lbl_key_status.configure(text="🔑 密钥就绪", text_color=("green", "lightgreen"))
-        else:
-            self.lbl_key_status.configure(text="⚠️ 密钥未就绪", text_color=("red", "orange"))
-
-    def _log_summary(self, text: str):
-        self.log_queue.put(text)
-
-    def _process_log_queue(self):
-        while not self.log_queue.empty():
-            msg = self.log_queue.get_nowait()
-            self.txt_summary_log.insert("end", msg + "\n")
-            self.txt_summary_log.see("end")
-        self.after(100, self._process_log_queue)
+    def _clear_summary_results(self):
+        """清空成果面板"""
+        self.txt_summary_result.delete("1.0", "end")
 
     def _clear_summary_log(self):
+        """清空日志面板"""
         self.txt_summary_log.delete("1.0", "end")
 
+    def _refresh_summary_status(self):
+        """刷新增量总结主界面的顶部状态提示"""
+        cfg = load_full_config()
+        groups = cfg.get("monitored_groups", [])
+        enabled_count = sum(1 for g in groups if isinstance(g, dict) and g.get("enabled"))
+
+        if groups:
+            self.lbl_monitored_groups.configure(
+                text=f"🎯 监控: 已启用 {enabled_count} 个群 (共保留 {len(groups)} 个)"
+            )
+        else:
+            patterns = cfg.get("group_patterns", ["*北京移动*"])
+            self.lbl_monitored_groups.configure(text=f"🎯 监控规则: {', '.join(patterns)}")
+
+        self.lbl_ai_engine.configure(text=f"🤖 AI 引擎: {get_ai_engine_desc(cfg)}")
+
+        keys_data = get_stored_keys()
+        self.key_count = len(keys_data)
+        if self.key_count > 0:
+            arrow = '▴' if self.keys_drawer_visible else '▾'
+            self.btn_key_status.configure(
+                text=f"🔑 密钥就绪 ({self.key_count}个) {arrow}",
+                text_color=("green", "lightgreen")
+            )
+        else:
+            self.btn_key_status.configure(text="⚠️ 密钥未就绪", text_color=("red", "orange"))
+
+    def _log_summary(self, text: str):
+        """由后台线程安全将日志推送至日志队列"""
+        self.log_queue.put(text)
+
+    def _on_summary_result(self, item: dict):
+        """由后台线程安全将 AI 总结成果推送至成果队列"""
+        self.result_queue.put(item)
+
+    def _process_queues(self):
+        """定时消费日志与成果队列：严格锁定视口，绝不自动滑到底部"""
+        # 1. 处理技术日志
+        while not self.log_queue.empty():
+            msg = self.log_queue.get_nowait()
+            safe_textbox_append(self.txt_summary_log, msg + "\n")
+            # 实时更新简明进度条
+            if "正在拉取" in msg or "正在全量分析" in msg or "重点总结已提炼完成" in msg:
+                clean_msg = msg.strip().replace("\n", " ")
+                if len(clean_msg) > 60:
+                    clean_msg = clean_msg[:60] + "..."
+                self.lbl_live_status.configure(text=clean_msg, text_color=("blue", "#38BDF8"))
+
+        # 2. 处理 AI 提炼成果
+        while not self.result_queue.empty():
+            item = self.result_queue.get_nowait()
+            sep = "=" * 55
+            card = (
+                f"\n{sep}\n"
+                f"📌 [{item['index']}/{item['total']}] 【{item['chat_name']}】重点总结 (新增 {item['count']} 条发言)\n"
+                f"{sep}\n\n"
+                f"{item['summary'].strip()}\n\n"
+            )
+            safe_textbox_append(self.txt_summary_result, card)
+
+        self.after(100, self._process_queues)
+
     def _start_summary_task(self):
+        """启动增量总结后台工作线程"""
         if self.is_running:
             return
 
         self.is_running = True
         self.btn_run_summary.configure(state="disabled", text="⏳ 正在检测与总结中...")
+        self.lbl_live_status.configure(
+            text="⏳ 增量总结检测启动中，正在连接本地数据库...",
+            text_color=("blue", "#38BDF8")
+        )
         auto_save = self.auto_save_var.get()
 
         def worker():
@@ -339,7 +582,8 @@ class WeChatAssistantApp(ctk.CTk):
                 run_incremental_summary(
                     log_fn=self._log_summary,
                     ask_save_fn=None,
-                    auto_save=auto_save
+                    auto_save=auto_save,
+                    result_fn=self._on_summary_result
                 )
             except Exception as e:
                 self._log_summary(f"\n❌ 执行出错: {str(e)}")
@@ -349,35 +593,42 @@ class WeChatAssistantApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_summary_finished(self):
+        """增量总结完成回调"""
         self.is_running = False
         self.btn_run_summary.configure(state="normal", text="🚀 立即执行增量总结")
+        self.lbl_live_status.configure(
+            text="✅ 增量总结执行完毕！最新成果已呈现在「✨ AI 总结成果」中",
+            text_color=("green", "lightgreen")
+        )
         self._refresh_summary_status()
 
     def _open_today_doc(self):
+        """打开今日总结归档 Markdown 文档"""
         doc = get_today_doc_path()
         if os.path.exists(doc):
             os.system(f'start "" "{doc}"')
         else:
-            messagebox.showinfo("提示", f"今日文档尚未生成（今天暂无增量记录）：\n{doc}")
+            messagebox.showinfo("提示", f"今日文档尚未生成（今天暂无增量记录或未开启写入）：\n{doc}")
 
     # =========================================================================
     # 视图 2：密钥管理
     # =========================================================================
     def _create_keys_view(self):
+        """构建密钥提取与扫码工具视图"""
         frame = ctk.CTkFrame(self, fg_color="transparent")
         frame.grid_columnconfigure(0, weight=1)
 
         card = ctk.CTkFrame(frame, corner_radius=10)
         card.pack(fill="x", padx=10, pady=10)
 
-        title = ctk.CTkLabel(card, text="🔑 微信解密密钥一键提取 / 更换工具", font=ctk.CTkFont(size=16, weight="bold"))
+        title = ctk.CTkLabel(card, text="🔑 微信解密密钥一键提取 / 更换工具", font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=16, weight="bold"))
         title.pack(anchor="w", padx=20, pady=(15, 5))
 
         desc = ctk.CTkLabel(
             card,
             text="从 Windows 微信 (Weixin.exe) 内存特征码中快速提取 64 位数据库密钥，全只读安全扫描，无账号风险。\n"
                  "每次切换微信账号、重新扫码登录微信、或初次使用时，请点击下方按钮提取密钥。",
-            font=ctk.CTkFont(size=13),
+            font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=13),
             text_color="gray",
             justify="left"
         )
@@ -390,21 +641,21 @@ class WeChatAssistantApp(ctk.CTk):
             btn_row,
             text="⚡ 一键扫描微信内存并提取密钥",
             height=38,
-            font=ctk.CTkFont(size=14, weight="bold"),
+            font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=14, weight="bold"),
             command=self._extract_keys_task
         )
         self.btn_extract_keys.pack(side="left")
 
-        self.lbl_keys_info = ctk.CTkLabel(btn_row, text="", font=ctk.CTkFont(size=13))
+        self.lbl_keys_info = ctk.CTkLabel(btn_row, text="", font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=13))
         self.lbl_keys_info.pack(side="left", padx=15)
 
         log_card = ctk.CTkFrame(frame, corner_radius=10)
         log_card.pack(fill="both", expand=True, padx=10, pady=(5, 10))
 
-        lbl_log = ctk.CTkLabel(log_card, text="扫描与提取日志:", font=ctk.CTkFont(size=14, weight="bold"))
+        lbl_log = ctk.CTkLabel(log_card, text="扫描与提取日志:", font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=14, weight="bold"))
         lbl_log.pack(anchor="w", padx=15, pady=(10, 5))
 
-        self.txt_keys_log = ctk.CTkTextbox(log_card, font=ctk.CTkFont(family="Consolas", size=13))
+        self.txt_keys_log = ctk.CTkTextbox(log_card, font=ctk.CTkFont(family=FONT_FAMILY_MONO, size=13))
         self.txt_keys_log.pack(fill="both", expand=True, padx=15, pady=(0, 15))
 
         def on_show():
@@ -413,28 +664,26 @@ class WeChatAssistantApp(ctk.CTk):
         return frame
 
     def _update_keys_info(self):
-        keys_file = os.path.expanduser("~/.wechat-cli/all_keys.json")
-        if os.path.exists(keys_file):
-            try:
-                with open(keys_file, "r", encoding="utf-8") as f:
-                    kc = len(json.load(f))
-                self.lbl_keys_info.configure(text=f"✅ 已配置 {kc} 个微信数据库密钥", text_color=("green", "lightgreen"))
-            except Exception:
-                self.lbl_keys_info.configure(text="✅ 密钥库文件已存在", text_color=("green", "lightgreen"))
+        """检查并更新密钥库状态"""
+        keys_data = get_stored_keys()
+        if keys_data:
+            self.lbl_keys_info.configure(text=f"✅ 已配置 {len(keys_data)} 个微信数据库密钥", text_color=("green", "lightgreen"))
         else:
             self.lbl_keys_info.configure(text="⚠️ 尚未提取密钥，请先点击提取", text_color=("red", "orange"))
 
     def _extract_keys_task(self):
+        """执行后台密钥扫描提取（静默无黑框）"""
         self.btn_extract_keys.configure(state="disabled", text="⏳ 正在扫描微信内存...")
         self.txt_keys_log.delete("1.0", "end")
 
         def worker():
             def log(m):
-                self.after(0, lambda: (self.txt_keys_log.insert("end", m + "\n"), self.txt_keys_log.see("end")))
+                self.after(0, lambda: safe_textbox_append(self.txt_keys_log, m + "\n"))
 
             log("正在检查微信客户端运行状态...")
+            kwargs = get_subprocess_flags()
             check = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Weixin.exe", "/NH"],
-                                   capture_output=True, text=True, errors="replace")
+                                   capture_output=True, text=True, errors="replace", **kwargs)
             if "Weixin.exe" not in check.stdout:
                 log("⚠️ 未检测到正在运行的 Weixin.exe！请先登录电脑端微信后再试。")
                 self.after(0, lambda: self.btn_extract_keys.configure(state="normal", text="⚡ 一键扫描微信内存并提取密钥"))
@@ -459,192 +708,359 @@ class WeChatAssistantApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     # =========================================================================
-    # 视图 3：监控群聊
+    # 视图 3：监控群聊 (精细清单勾选 + 微信活跃群直接呈现点选)
     # =========================================================================
     def _create_groups_view(self):
+        """构建监控群聊管理视图：上下双卡片架构"""
         frame = ctk.CTkFrame(self, fg_color="transparent")
         frame.grid_columnconfigure(0, weight=1)
-        frame.grid_rowconfigure(2, weight=1)
+        frame.grid_rowconfigure((0, 1), weight=1)
 
-        # 当前配置卡片
-        card = ctk.CTkFrame(frame, corner_radius=10)
-        card.grid(row=0, column=0, sticky="ew", padx=10, pady=(5, 10))
+        self._build_configured_groups_card(frame)
+        self._build_discovered_groups_card(frame)
 
-        title = ctk.CTkLabel(card, text="🎯 目标监控群聊管理", font=ctk.CTkFont(size=16, weight="bold"))
-        title.pack(anchor="w", padx=15, pady=(10, 5))
-
-        self.lbl_current_rules = ctk.CTkLabel(card, text="当前规则: 加载中...", font=ctk.CTkFont(size=13))
-        self.lbl_current_rules.pack(anchor="w", padx=15, pady=(0, 10))
-
-        # 手动输入规则栏
-        rule_row = ctk.CTkFrame(card, fg_color="transparent")
-        rule_row.pack(fill="x", padx=15, pady=(0, 15))
-
-        self.ent_pattern = ctk.CTkEntry(rule_row, placeholder_text="输入群名规则（支持通配符，多个用逗号隔开，如: *北京移动*, *业主群*）", width=450)
-        self.ent_pattern.pack(side="left", fill="x", expand=True, padx=(0, 10))
-
-        btn_save_rule = ctk.CTkButton(rule_row, text="💾 保存规则", width=100, command=self._save_group_pattern)
-        btn_save_rule.pack(side="left", padx=(0, 10))
-
-        btn_reset_default = ctk.CTkButton(rule_row, text="🔄 恢复默认", width=100, fg_color=("gray70", "gray30"), command=self._reset_group_pattern)
-        btn_reset_default.pack(side="left")
-
-        # 搜索与群列表工具栏
-        search_card = ctk.CTkFrame(frame, corner_radius=10)
-        search_card.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 5))
-
-        self.ent_search_group = ctk.CTkEntry(search_card, placeholder_text="输入关键词搜索微信中的群聊 (如: 移动 / 技术 / 交流)", width=350)
-        self.ent_search_group.pack(side="left", padx=15, pady=10, fill="x", expand=True)
-
-        btn_search = ctk.CTkButton(search_card, text="🔍 搜索群聊", width=100, command=self._search_groups)
-        btn_search.pack(side="left", padx=(0, 10), pady=10)
-
-        btn_fetch_all = ctk.CTkButton(search_card, text="📋 列出全部活跃群", width=130, fg_color=("gray70", "gray30"), command=self._fetch_all_groups)
-        btn_fetch_all.pack(side="left", padx=(0, 15), pady=10)
-
-        # 群聊列表容器
-        self.scroll_groups = ctk.CTkScrollableFrame(frame, corner_radius=10)
-        self.scroll_groups.grid(row=2, column=0, sticky="nsew", padx=10, pady=(5, 10))
-
-        def on_show():
-            self._load_group_patterns_display()
-        frame.on_show = on_show
+        frame.on_show = self._on_groups_view_shown
         return frame
 
-    def _load_group_patterns_display(self):
-        patterns, _, _ = load_user_config()
-        self.lbl_current_rules.configure(text=f"当前规则: {', '.join(patterns)}")
-        self.ent_pattern.delete(0, "end")
-        self.ent_pattern.insert(0, ", ".join(patterns))
+    def _build_configured_groups_card(self, parent):
+        """Card 1: 已定制的监控群聊清单卡片 (精准勾选、增删、保存)"""
+        card = ctk.CTkFrame(parent, corner_radius=10)
+        card.grid(row=0, column=0, sticky="nsew", padx=10, pady=(5, 6))
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_rowconfigure(2, weight=1)
 
-    def _save_group_pattern(self):
-        val = self.ent_pattern.get().strip()
-        if not val:
-            messagebox.showwarning("警告", "规则不能为空！")
+        self.lbl_configured_title = ctk.CTkLabel(
+            card,
+            text="🎯 我的监控群聊清单 (勾选以启用总结，未勾选仅保留在列表中跳过总结)",
+            font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=15, weight="bold")
+        )
+        self.lbl_configured_title.grid(row=0, column=0, sticky="w", padx=15, pady=(10, 6))
+
+        row_add = ctk.CTkFrame(card, fg_color="transparent")
+        row_add.grid(row=1, column=0, sticky="ew", padx=15, pady=(0, 8))
+
+        self.ent_add_group = ctk.CTkEntry(
+            row_add,
+            placeholder_text="输入群聊精确全名，例如：北京移动7群",
+            font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=13),
+            width=360
+        )
+        self.ent_add_group.pack(side="left", fill="x", expand=True, padx=(0, 10))
+
+        buttons = [
+            ("➕ 手动添加", 95, "#2563EB", self._add_group_from_entry),
+            ("☑️ 全选", 70, ("gray75", "gray30"), self._select_all_groups),
+            ("⬜ 全不选", 75, ("gray75", "gray30"), self._unselect_all_groups),
+            ("💾 保存清单", 90, "#2563EB", self._save_groups_manually),
+        ]
+        for txt, w, fg, cmd in buttons:
+            kw = {"fg_color": fg} if fg else {}
+            ctk.CTkButton(row_add, text=txt, width=w, command=cmd, **kw).pack(side="left", padx=(0, 8))
+
+        self.scroll_configured_groups = ctk.CTkScrollableFrame(card, corner_radius=8)
+        self.scroll_configured_groups.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
+
+    def _build_discovered_groups_card(self, parent):
+        """Card 2: 微信本地活跃群聊发现卡片 (直接呈现全部现有群聊、实时搜索、一键点选加入)"""
+        card = ctk.CTkFrame(parent, corner_radius=10)
+        card.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 8))
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_rowconfigure(1, weight=1)
+
+        disc_header = ctk.CTkFrame(card, fg_color="transparent")
+        disc_header.grid(row=0, column=0, sticky="ew", padx=15, pady=(8, 6))
+
+        self.lbl_disc_title = ctk.CTkLabel(
+            disc_header,
+            text="🔍 微信本地活跃群聊 (点击「选择加入监控」按钮快速加入上方清单)",
+            font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=14, weight="bold")
+        )
+        self.lbl_disc_title.pack(side="left")
+
+        self.ent_search_discovered = ctk.CTkEntry(
+            disc_header,
+            placeholder_text="实时搜索群名或发言...",
+            font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=12),
+            width=220
+        )
+        self.ent_search_discovered.pack(side="left", padx=12)
+        self.ent_search_discovered.bind("<KeyRelease>", lambda e: self._on_search_key_release())
+
+        btn_fetch_all = ctk.CTkButton(
+            disc_header,
+            text="🔄 刷新全部活跃群",
+            width=135,
+            height=28,
+            fg_color=("gray75", "gray30"),
+            command=lambda: self._fetch_all_wechat_groups(force=True)
+        )
+        btn_fetch_all.pack(side="left")
+
+        self.scroll_discovered_groups = ctk.CTkScrollableFrame(card, corner_radius=8)
+        self.scroll_discovered_groups.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+
+    def _on_groups_view_shown(self):
+        """切换到群聊视图时的自动刷新与呈现逻辑"""
+        self._load_and_render_groups()
+        if not self.cached_wechat_groups:
+            self._fetch_all_wechat_groups(force=False)
+        else:
+            self._filter_and_render_discovered()
+
+    def _load_and_render_groups(self):
+        """加载配置并渲染群聊列表"""
+        cfg = load_full_config()
+        self.configured_groups = cfg.get("monitored_groups", [])
+        self._render_configured_groups()
+
+    def _render_configured_groups(self):
+        """渲染已配置群聊的每一项及勾选框"""
+        for w in self.scroll_configured_groups.winfo_children():
+            w.destroy()
+
+        enabled_count = sum(1 for g in self.configured_groups if g.get("enabled"))
+        total_count = len(self.configured_groups)
+        self.lbl_configured_title.configure(
+            text=f"🎯 我的监控群聊清单 (已添加 {total_count} 个，已勾选启用 {enabled_count} 个)"
+        )
+
+        if not self.configured_groups:
+            ctk.CTkLabel(
+                self.scroll_configured_groups,
+                text="当前监控清单为空。可在下方微信活跃群聊中点击「➕ 选择加入监控」添加。",
+                font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=13),
+                text_color="gray"
+            ).pack(pady=25)
             return
-        patterns = [p.strip() for p in val.replace("，", ",").split(",") if p.strip()]
 
-        cfg = {}
-        if os.path.exists(CONFIG_FILE):
+        for item in self.configured_groups:
+            self._build_configured_group_row(item)
+
+    def _build_configured_group_row(self, item: dict):
+        """构建单个监控群聊条目组件（含复选框、状态指示、移除按钮）"""
+        name = item.get("name", "").strip()
+        enabled = bool(item.get("enabled", True))
+
+        row = ctk.CTkFrame(self.scroll_configured_groups, fg_color="transparent")
+        row.pack(fill="x", padx=10, pady=3)
+
+        var = ctk.BooleanVar(value=enabled)
+        ctk.CTkCheckBox(
+            row,
+            text=name,
+            variable=var,
+            font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=13),
+            command=lambda n=name, v=var: self._on_group_check_changed(n, v.get())
+        ).pack(side="left", padx=5)
+
+        status_text = " [已启用总结]" if enabled else " [已暂停总结-仅保留]"
+        status_color = ("green", "#4ADE80") if enabled else "gray"
+        ctk.CTkLabel(
+            row,
+            text=status_text,
+            font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=12),
+            text_color=status_color
+        ).pack(side="left", padx=8)
+
+        ctk.CTkButton(
+            row,
+            text="🗑️ 移除",
+            width=65,
+            height=26,
+            fg_color=("gray75", "gray30"),
+            command=lambda n=name: self._remove_group(n)
+        ).pack(side="right", padx=5)
+
+    def _save_groups_quietly(self):
+        """静默持久化配置"""
+        cfg = load_full_config()
+        cfg["monitored_groups"] = self.configured_groups
+        save_full_config(cfg)
+
+    def _sync_groups_state(self):
+        """统一持久化群聊配置并同步更新所有相关视图"""
+        self._save_groups_quietly()
+        self._render_configured_groups()
+        self._refresh_summary_status()
+        self._filter_and_render_discovered()
+
+    def _on_group_check_changed(self, group_name: str, enabled: bool):
+        """当用户在群聊清单中勾选或取消勾选时触发"""
+        for g in self.configured_groups:
+            if g.get("name") == group_name:
+                g["enabled"] = enabled
+                break
+        self._sync_groups_state()
+
+    def _add_group_from_entry(self):
+        """从输入框精确添加群聊"""
+        name = self.ent_add_group.get().strip()
+        if not name:
+            messagebox.showwarning("提示", "请输入要添加的群聊名称！")
+            return
+        self._add_group_direct(name, show_popup=True)
+        self.ent_add_group.delete(0, "end")
+
+    def _add_group_direct(self, name: str, show_popup: bool = True):
+        """将群聊加入监控清单"""
+        if any(g.get("name") == name for g in self.configured_groups):
+            if show_popup:
+                messagebox.showinfo("提示", f"【{name}】已在监控清单中！")
+            return
+        self.configured_groups.append({"name": name, "enabled": True})
+        self._sync_groups_state()
+        if show_popup:
+            messagebox.showinfo("成功", f"已成功将【{name}】添加并启用总结！")
+
+    def _remove_group(self, name: str):
+        """从监控清单中移除群聊"""
+        self.configured_groups = [g for g in self.configured_groups if g.get("name") != name]
+        self._sync_groups_state()
+
+    def _toggle_all_groups(self, enabled: bool):
+        """批量全选/全不选群聊"""
+        for g in self.configured_groups:
+            g["enabled"] = enabled
+        self._sync_groups_state()
+
+    def _select_all_groups(self):
+        self._toggle_all_groups(True)
+
+    def _unselect_all_groups(self):
+        self._toggle_all_groups(False)
+
+    def _save_groups_manually(self):
+        """手动点击保存按钮"""
+        self._save_groups_quietly()
+        messagebox.showinfo("成功", "监控群聊清单已成功保存！增量总结将精准生效。")
+
+    def _fetch_all_wechat_groups(self, force: bool = False):
+        """从微信本地数据库读取活跃群聊并直接列出"""
+        for w in self.scroll_discovered_groups.winfo_children():
+            w.destroy()
+        loading = ctk.CTkLabel(
+            self.scroll_discovered_groups,
+            text="⏳ 正在直接读取微信本地活跃群聊，请稍候...",
+            font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=13)
+        )
+        loading.pack(pady=20)
+
+        def worker():
+            raw = run_cli_command(["sessions", "--limit", "300", "--format", "json"])
+            group_items = []
+            if raw:
+                try:
+                    data = json.loads(raw)
+                    seen = set()
+                    for s in data:
+                        if s.get("is_group"):
+                            chat = s.get("chat", "").strip()
+                            if chat and chat not in seen:
+                                seen.add(chat)
+                                group_items.append(s)
+                except Exception:
+                    pass
+            self.cached_wechat_groups = group_items
             try:
-                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
+                self.after(0, self._filter_and_render_discovered)
             except Exception:
                 pass
-        cfg["group_patterns"] = patterns
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-
-        self._load_group_patterns_display()
-        messagebox.showinfo("成功", f"监控规则已成功保存为:\n{patterns}")
-
-    def _reset_group_pattern(self):
-        self.ent_pattern.delete(0, "end")
-        self.ent_pattern.insert(0, "*北京移动*")
-        self._save_group_pattern()
-
-    def _fetch_all_groups(self):
-        for widget in self.scroll_groups.winfo_children():
-            widget.destroy()
-
-        loading_lbl = ctk.CTkLabel(self.scroll_groups, text="正在读取本地活跃群聊列表...", font=ctk.CTkFont(size=13))
-        loading_lbl.pack(pady=20)
-
-        def worker():
-            raw = run_cli_command(["sessions", "--limit", "100", "--format", "json"])
-            groups = []
-            if raw:
-                try:
-                    data = json.loads(raw)
-                    for s in data:
-                        if s.get("is_group"):
-                            chat = s.get("chat", "").strip()
-                            if chat:
-                                groups.append(chat)
-                except Exception:
-                    pass
-            self.after(0, lambda: self._display_group_list(groups))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _search_groups(self):
-        keyword = self.ent_search_group.get().strip().lower()
-        if not keyword:
-            self._fetch_all_groups()
-            return
+    def _on_search_key_release(self):
+        """实时按键搜索过滤"""
+        self._filter_and_render_discovered()
 
-        for widget in self.scroll_groups.winfo_children():
-            widget.destroy()
+    def _filter_and_render_discovered(self):
+        """按搜索词过滤并渲染下方的微信活跃群列表"""
+        kw = self.ent_search_discovered.get().strip().lower()
+        if kw:
+            filtered = [
+                g for g in self.cached_wechat_groups
+                if kw in g.get("chat", "").lower()
+                or kw in g.get("last_message", "").lower()
+                or kw in g.get("sender", "").lower()
+            ]
+        else:
+            filtered = self.cached_wechat_groups
 
-        loading_lbl = ctk.CTkLabel(self.scroll_groups, text=f"正在搜索包含【{keyword}】的群聊...", font=ctk.CTkFont(size=13))
-        loading_lbl.pack(pady=20)
+        self._display_discovered_groups(filtered)
 
-        def worker():
-            raw = run_cli_command(["sessions", "--limit", "100", "--format", "json"])
-            matched = []
-            if raw:
-                try:
-                    data = json.loads(raw)
-                    for s in data:
-                        if s.get("is_group"):
-                            chat = s.get("chat", "").strip()
-                            if keyword in chat.lower():
-                                matched.append(chat)
-                except Exception:
-                    pass
-            self.after(0, lambda: self._display_group_list(matched))
+    def _on_select_group_to_monitor(self, name: str):
+        """一键选择加入监控"""
+        self._add_group_direct(name, show_popup=False)
 
-        threading.Thread(target=worker, daemon=True).start()
+    def _display_discovered_groups(self, groups: list):
+        """渲染从微信读取到的群聊列表，支持上下滑动与一键选择加入"""
+        for w in self.scroll_discovered_groups.winfo_children():
+            w.destroy()
 
-    def _display_group_list(self, groups: list):
-        for widget in self.scroll_groups.winfo_children():
-            widget.destroy()
+        self.lbl_disc_title.configure(
+            text=f"🔍 微信本地活跃群聊 (已列出 {len(groups)}/{len(self.cached_wechat_groups)} 个，点击按钮加入监控)"
+        )
 
         if not groups:
-            lbl = ctk.CTkLabel(self.scroll_groups, text="未找到匹配的群聊，请确认已提取密钥且微信有聊天记录。", font=ctk.CTkFont(size=13), text_color="gray")
-            lbl.pack(pady=20)
+            ctk.CTkLabel(
+                self.scroll_discovered_groups,
+                text="未找到匹配群聊。可点击「🔄 刷新全部活跃群」重新读取。",
+                font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=13),
+                text_color="gray"
+            ).pack(pady=20)
             return
 
-        patterns, _, _ = load_user_config()
+        configured_names = {g["name"] for g in self.configured_groups}
+        for item in groups:
+            chat_name = item.get("chat", "").strip()
+            self._build_discovered_group_row(item, chat_name in configured_names)
 
-        for g in groups:
-            row = ctk.CTkFrame(self.scroll_groups, fg_color="transparent")
-            row.pack(fill="x", padx=10, pady=4)
+    def _build_discovered_group_row(self, item: dict, in_list: bool):
+        """构建单个微信活跃群的展示行组件"""
+        chat_name = item.get("chat", "").strip()
+        unread = item.get("unread", 0)
+        msg_time = item.get("time", "")
+        last_msg = item.get("last_message", "")
+        sender = item.get("sender", "")
 
-            is_monitored = any(fnmatch(g, p) for p in patterns)
-            badge_text = " [已监控]" if is_monitored else ""
-            badge_color = ("green", "lightgreen") if is_monitored else ("gray10", "gray90")
+        row = ctk.CTkFrame(self.scroll_discovered_groups, fg_color=("gray95", "#1E222A"), corner_radius=6)
+        row.pack(fill="x", padx=6, pady=3)
 
-            lbl = ctk.CTkLabel(row, text=f"• {g}{badge_text}", font=ctk.CTkFont(size=13), text_color=badge_color, anchor="w")
-            lbl.pack(side="left", padx=5)
+        info_frame = ctk.CTkFrame(row, fg_color="transparent")
+        info_frame.pack(side="left", fill="both", expand=True, padx=8, pady=4)
 
-            btn = ctk.CTkButton(
-                row,
-                text="设为监控" if not is_monitored else "已添加",
-                width=80,
-                height=28,
-                fg_color=("gray70", "gray30") if is_monitored else None,
-                command=lambda name=g: self._add_single_group_pattern(name)
-            )
-            btn.pack(side="right", padx=5)
+        top_line = ctk.CTkFrame(info_frame, fg_color="transparent")
+        top_line.pack(fill="x", anchor="w")
 
-    def _add_single_group_pattern(self, name: str):
-        patterns, _, _ = load_user_config()
-        if name not in patterns:
-            patterns.append(name)
-            cfg = {}
-            if os.path.exists(CONFIG_FILE):
-                try:
-                    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                        cfg = json.load(f)
-                except Exception:
-                    pass
-            cfg["group_patterns"] = patterns
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
-            self._load_group_patterns_display()
-            self._fetch_all_groups()
-            messagebox.showinfo("成功", f"已成功将【{name}】加入监控！")
+        ctk.CTkLabel(
+            top_line, text=f"👥 {chat_name}", font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=13, weight="bold")
+        ).pack(side="left")
+
+        if unread > 0:
+            ctk.CTkLabel(
+                top_line, text=f" {unread}条未读", font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=11), text_color="#F59E0B"
+            ).pack(side="left", padx=6)
+
+        if msg_time or last_msg:
+            sub = f"🕒 {msg_time}" + (f" · {sender}" if sender else "")
+            if last_msg:
+                clean = last_msg.replace("\n", " ").strip()
+                sub += f": {clean[:35]}..." if len(clean) > 35 else f": {clean}"
+            ctk.CTkLabel(
+                info_frame, text=sub, font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=11),
+                text_color="gray", anchor="w"
+            ).pack(fill="x", anchor="w", pady=(1, 0))
+
+        if in_list:
+            ctk.CTkLabel(
+                row, text="✅ 已在监控中", font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=12, weight="bold"),
+                text_color=("green", "#4ADE80"), width=115
+            ).pack(side="right", padx=10)
+        else:
+            ctk.CTkButton(
+                row, text="➕ 选择加入监控", font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=12, weight="bold"),
+                width=115, height=28, fg_color="#2563EB", hover_color="#1D4ED8", cursor="hand2",
+                command=lambda name=chat_name: self._on_select_group_to_monitor(name)
+            ).pack(side="right", padx=8, pady=4)
 
     # =========================================================================
     # 视图 4：AI 模型配置
@@ -673,17 +1089,19 @@ class WeChatAssistantApp(ctk.CTk):
         preset_frame = ctk.CTkFrame(card, fg_color="transparent")
         preset_frame.pack(fill="x", padx=20, pady=(0, 15))
 
-        lbl_presets = ctk.CTkLabel(preset_frame, text="快速预设:", font=ctk.CTkFont(size=13, weight="bold"))
-        lbl_presets.pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(preset_frame, text="快速预设:", font=ctk.CTkFont(size=13, weight="bold")).pack(side="left", padx=(0, 10))
 
-        btn_preset_gemini = ctk.CTkButton(preset_frame, text="🌟 Google Gemini", width=120, command=self._preset_gemini)
-        btn_preset_gemini.pack(side="left", padx=(0, 8))
-
-        btn_preset_deepseek = ctk.CTkButton(preset_frame, text="🚀 DeepSeek", width=110, command=self._preset_deepseek)
-        btn_preset_deepseek.pack(side="left", padx=(0, 8))
-
-        btn_preset_ollama = ctk.CTkButton(preset_frame, text="🛠️ 本地 Ollama", width=110, fg_color=("gray70", "gray30"), command=self._preset_ollama)
-        btn_preset_ollama.pack(side="left", padx=(0, 8))
+        presets = [
+            ("🌟 Google Gemini", "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent", 125, None),
+            ("🚀 DeepSeek", "https://api.deepseek.com/chat/completions", 110, None),
+            ("🛠️ 本地 Ollama", "http://localhost:11434/v1/chat/completions", 110, ("gray70", "gray30")),
+        ]
+        for text, url, width, fg in presets:
+            kw = {"fg_color": fg} if fg else {}
+            ctk.CTkButton(
+                preset_frame, text=text, width=width,
+                command=lambda u=url: self._set_api_url(u), **kw
+            ).pack(side="left", padx=(0, 8))
 
         btn_clear_key = ctk.CTkButton(preset_frame, text="❌ 清空密钥", width=90, fg_color=("gray70", "gray30"), command=self._clear_ai_key)
         btn_clear_key.pack(side="left")
@@ -726,17 +1144,9 @@ class WeChatAssistantApp(ctk.CTk):
             self.ent_api_key.configure(show="*")
             self.btn_toggle_key.configure(text="👁️ 显示")
 
-    def _preset_gemini(self):
+    def _set_api_url(self, url: str):
         self.ent_api_url.delete(0, "end")
-        self.ent_api_url.insert(0, "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent")
-
-    def _preset_deepseek(self):
-        self.ent_api_url.delete(0, "end")
-        self.ent_api_url.insert(0, "https://api.deepseek.com/chat/completions")
-
-    def _preset_ollama(self):
-        self.ent_api_url.delete(0, "end")
-        self.ent_api_url.insert(0, "http://localhost:11434/v1/chat/completions")
+        self.ent_api_url.insert(0, url)
 
     def _clear_ai_key(self):
         self.ent_api_key.delete(0, "end")
@@ -744,27 +1154,15 @@ class WeChatAssistantApp(ctk.CTk):
 
     def _load_ai_config_display(self):
         _, url, key = load_user_config()
-        self.ent_api_url.delete(0, "end")
-        self.ent_api_url.insert(0, url)
+        self._set_api_url(url)
         self.ent_api_key.delete(0, "end")
         self.ent_api_key.insert(0, key)
 
     def _save_ai_config(self):
-        url = self.ent_api_url.get().strip()
-        key = self.ent_api_key.get().strip()
-
-        cfg = {}
-        if os.path.exists(CONFIG_FILE):
-            try:
-                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-            except Exception:
-                pass
-        cfg["ai_api_url"] = url
-        cfg["ai_api_key"] = key
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-
+        cfg = load_full_config()
+        cfg["ai_api_url"] = self.ent_api_url.get().strip()
+        cfg["ai_api_key"] = self.ent_api_key.get().strip()
+        save_full_config(cfg)
         self._refresh_summary_status()
         messagebox.showinfo("成功", "AI 模型配置已更新成功！")
 
@@ -857,43 +1255,69 @@ class WeChatAssistantApp(ctk.CTk):
     # 视图 6：隐私清理
     # =========================================================================
     def _create_cleanup_view(self):
+        """构建隐私清理卡片视图"""
         frame = ctk.CTkFrame(self, fg_color="transparent")
         frame.grid_columnconfigure(0, weight=1)
 
-        # 等级 1 卡片
-        card1 = ctk.CTkFrame(frame, corner_radius=10)
-        card1.pack(fill="x", padx=10, pady=8)
+        cards_data = [
+            (
+                "🟢 等级 1：轻度重置（仅清理临时缓存 + 重置同步时间戳）",
+                "• 动作：删除 last_sync.json 及解密图片缓存\n• 保留：保留微信解密密钥、保留每日总结文档、保留虚拟环境\n• 适合：想重新完整抓取消息，但不想重新提取微信密钥",
+                "执行等级 1 重置", ("#2FA572", "#248A5E"), self._do_cleanup_level_1
+            ),
+            (
+                "🟡 等级 2：隐私脱敏（粉碎全部微信密钥 + 删除历史总结文档）",
+                "• 动作：粉碎 ~/.wechat-cli (密钥全部抹除) + 彻底删除 summaries 文档\n• 保留：保留 Python 虚拟环境与工具本身\n• 适合：借电脑给他人，确保任何微信密钥与聊天内容彻底无残留",
+                "执行等级 2 脱敏", ("#D97706", "#B45309"), self._do_cleanup_level_2
+            ),
+            (
+                "🔴 等级 3：终极销毁（退电脑/归还电脑模式，粉碎一切）",
+                "• 动作：粉碎全部密钥 + 彻底删除总结文档 + 注销定时任务\n• 适合：彻底不再使用这台电脑，电脑不留任何运行轨迹与聊天隐私",
+                "执行等级 3 销毁", ("#DC2626", "#B91C1C"), self._do_cleanup_level_3
+            )
+        ]
 
-        t1 = ctk.CTkLabel(card1, text="🟢 等级 1：轻度重置（仅清理临时缓存 + 重置同步时间戳）", font=ctk.CTkFont(size=14, weight="bold"))
-        t1.pack(anchor="w", padx=15, pady=(12, 4))
-        d1 = ctk.CTkLabel(card1, text="• 动作：删除 last_sync.json 及解密图片缓存\n• 保留：保留微信解密密钥、保留每日总结文档、保留虚拟环境\n• 适合：想重新完整抓取消息，但不想重新提取微信密钥", font=ctk.CTkFont(size=12), text_color="gray", justify="left")
-        d1.pack(anchor="w", padx=15, pady=(0, 8))
-        b1 = ctk.CTkButton(card1, text="执行等级 1 重置", width=140, fg_color="#2FA572", hover_color="#248A5E", command=self._do_cleanup_level_1)
-        b1.pack(anchor="w", padx=15, pady=(0, 12))
-
-        # 等级 2 卡片
-        card2 = ctk.CTkFrame(frame, corner_radius=10)
-        card2.pack(fill="x", padx=10, pady=8)
-
-        t2 = ctk.CTkLabel(card2, text="🟡 等级 2：隐私脱敏（粉碎全部微信密钥 + 删除历史总结文档）", font=ctk.CTkFont(size=14, weight="bold"))
-        t2.pack(anchor="w", padx=15, pady=(12, 4))
-        d2 = ctk.CTkLabel(card2, text="• 动作：粉碎 ~/.wechat-cli (密钥全部抹除) + 彻底删除 summaries 文档\n• 保留：保留 Python 虚拟环境与工具本身\n• 适合：借电脑给他人，确保任何微信密钥与聊天内容彻底无残留", font=ctk.CTkFont(size=12), text_color="gray", justify="left")
-        d2.pack(anchor="w", padx=15, pady=(0, 8))
-        b2 = ctk.CTkButton(card2, text="执行等级 2 脱敏", width=140, fg_color="#D97706", hover_color="#B45309", command=self._do_cleanup_level_2)
-        b2.pack(anchor="w", padx=15, pady=(0, 12))
-
-        # 等级 3 卡片
-        card3 = ctk.CTkFrame(frame, corner_radius=10)
-        card3.pack(fill="x", padx=10, pady=8)
-
-        t3 = ctk.CTkLabel(card3, text="🔴 等级 3：终极销毁（退电脑/归还电脑模式，粉碎一切）", font=ctk.CTkFont(size=14, weight="bold"))
-        t3.pack(anchor="w", padx=15, pady=(12, 4))
-        d3 = ctk.CTkLabel(card3, text="• 动作：粉碎全部密钥 + 彻底删除总结文档 + 注销定时任务\n• 适合：彻底不再使用这台电脑，电脑不留任何运行轨迹与聊天隐私", font=ctk.CTkFont(size=12), text_color="gray", justify="left")
-        d3.pack(anchor="w", padx=15, pady=(0, 8))
-        b3 = ctk.CTkButton(card3, text="执行等级 3 销毁", width=140, fg_color="#DC2626", hover_color="#B91C1C", command=self._do_cleanup_level_3)
-        b3.pack(anchor="w", padx=15, pady=(0, 12))
+        for title, desc, btn_txt, colors, cmd in cards_data:
+            self._build_cleanup_card(frame, title, desc, btn_txt, colors, cmd)
 
         return frame
+
+    def _build_cleanup_card(self, parent, title: str, desc: str, btn_text: str, colors: tuple, command):
+        """构建隐私清理等级卡片组件"""
+        card = ctk.CTkFrame(parent, corner_radius=10)
+        card.pack(fill="x", padx=10, pady=8)
+
+        ctk.CTkLabel(
+            card, text=title, font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=14, weight="bold")
+        ).pack(anchor="w", padx=15, pady=(12, 4))
+
+        ctk.CTkLabel(
+            card, text=desc, font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=12),
+            text_color="gray", justify="left"
+        ).pack(anchor="w", padx=15, pady=(0, 8))
+
+        ctk.CTkButton(
+            card, text=btn_text, width=140, fg_color=colors[0], hover_color=colors[1],
+            command=command
+        ).pack(anchor="w", padx=15, pady=(0, 12))
+
+    def _purge_privacy_data(self, include_config: bool = False):
+        """统一执行隐私数据物理粉碎（密钥、时间戳、历史总结、Windows 定时任务）"""
+        user_dir = os.path.expanduser("~/.wechat-cli")
+        if os.path.exists(user_dir):
+            shutil.rmtree(user_dir, ignore_errors=True)
+        if os.path.exists(LAST_SYNC_FILE):
+            os.remove(LAST_SYNC_FILE)
+        if os.path.exists(SUMMARIES_DIR):
+            shutil.rmtree(SUMMARIES_DIR, ignore_errors=True)
+        if include_config and os.path.exists(CONFIG_FILE):
+            try:
+                os.remove(CONFIG_FILE)
+            except Exception:
+                pass
+        kwargs = get_subprocess_flags()
+        subprocess.run(["schtasks", "/delete", "/tn", "微信群定时增量总结", "/f"], capture_output=True, **kwargs)
+        self._refresh_summary_status()
 
     def _do_cleanup_level_1(self):
         if not messagebox.askyesno("确认", "确定执行【等级 1：轻度重置】吗？\n将删除时间戳并清空临时解密图片缓存。"):
@@ -909,32 +1333,14 @@ class WeChatAssistantApp(ctk.CTk):
         self._refresh_summary_status()
 
     def _do_cleanup_level_2(self):
-        if not messagebox.askyesno("警告", "确定执行【等级 2：隐私脱敏】吗？\n将粉碎 ~/.wechat-cli 微信密钥并删除所有总结文档！"):
-            return
-        user_dir = os.path.expanduser("~/.wechat-cli")
-        if os.path.exists(user_dir):
-            shutil.rmtree(user_dir, ignore_errors=True)
-        if os.path.exists(LAST_SYNC_FILE):
-            os.remove(LAST_SYNC_FILE)
-        if os.path.exists(SUMMARIES_DIR):
-            shutil.rmtree(SUMMARIES_DIR, ignore_errors=True)
-        os.system("schtasks /delete /tn \"微信群定时增量总结\" /f >nul 2>&1")
-        messagebox.showinfo("完成", "等级 2 脱敏完成！微信密钥与历史聊天总结已彻底抹除。")
-        self._refresh_summary_status()
+        if messagebox.askyesno("警告", "确定执行【等级 2：隐私脱敏】吗？\n将粉碎 ~/.wechat-cli 微信密钥并删除所有总结文档！"):
+            self._purge_privacy_data(include_config=False)
+            messagebox.showinfo("完成", "等级 2 脱敏完成！微信密钥与历史聊天总结已彻底抹除。")
 
     def _do_cleanup_level_3(self):
-        if not messagebox.askyesno("危险确认", "确定执行【等级 3：终极销毁】吗？\n电脑上所有微信密钥、纪要文档及相关配置将被永久销毁！"):
-            return
-        user_dir = os.path.expanduser("~/.wechat-cli")
-        if os.path.exists(user_dir):
-            shutil.rmtree(user_dir, ignore_errors=True)
-        if os.path.exists(LAST_SYNC_FILE):
-            os.remove(LAST_SYNC_FILE)
-        if os.path.exists(SUMMARIES_DIR):
-            shutil.rmtree(SUMMARIES_DIR, ignore_errors=True)
-        os.system("schtasks /delete /tn \"微信群定时增量总结\" /f >nul 2>&1")
-        messagebox.showinfo("完成", "等级 3 终极销毁完成！电脑未残留任何隐私痕迹。")
-        self._refresh_summary_status()
+        if messagebox.askyesno("危险确认", "确定执行【等级 3：终极销毁】吗？\n电脑上所有微信密钥、纪要文档及相关配置将被永久销毁！"):
+            self._purge_privacy_data(include_config=True)
+            messagebox.showinfo("完成", "等级 3 终极销毁完成！电脑未残留任何隐私痕迹。")
 
 
 def main():

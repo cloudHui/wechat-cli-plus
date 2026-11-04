@@ -39,8 +39,9 @@ class MBI(ctypes.Structure):
 
 def _get_pids():
     """返回所有 Weixin.exe 进程的 (pid, mem_kb) 列表，按内存降序"""
+    kwargs = {"creationflags": 0x08000000} if os.name == 'nt' else {}
     r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Weixin.exe", "/FO", "CSV", "/NH"],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, **kwargs)
     pids = []
     for line in r.stdout.strip().split('\n'):
         if not line.strip():
