@@ -48,6 +48,7 @@ from auto_summary import (
     load_user_config,
     load_full_config,
     save_full_config,
+    update_full_config,
     get_today_doc_path,
     get_agy_path,
     get_antigravity_exe,
@@ -77,7 +78,7 @@ FONT_FAMILY_MONO = "Consolas"
 
 
 def safe_textbox_append(textbox: ctk.CTkTextbox, text: str):
-    """向文本框追加文本并严格锁定视口，绝不自动滑到底部（保持用户当前正在看的位置）"""
+    """向成果文本框追加文本并严格锁定视口，保留用户当前阅读位置"""
     raw = textbox._textbox
     try:
         top_index = raw.index("@0,0")
@@ -88,6 +89,15 @@ def safe_textbox_append(textbox: ctk.CTkTextbox, text: str):
 
     try:
         raw.see(top_index)
+    except Exception:
+        pass
+
+
+def log_textbox_append(textbox: ctk.CTkTextbox, text: str):
+    """向日志文本框追加内容并实时自动滚动滑到最新最底部"""
+    textbox.insert("end", text)
+    try:
+        textbox._textbox.see("end")
     except Exception:
         pass
 
@@ -313,15 +323,14 @@ class WeChatAssistantApp(ctk.CTk):
 
     def _toggle_keys_drawer(self):
         """切换密钥面板的展开与收起状态"""
+        self.keys_drawer_visible = not self.keys_drawer_visible
         if self.keys_drawer_visible:
-            self.keys_drawer.grid_forget()
-            self.keys_drawer_visible = False
-            self.btn_key_status.configure(text=f"🔑 密钥就绪 ({self.key_count}个) ▾")
-        else:
             self.keys_drawer.grid(row=1, column=0, sticky="ew", pady=(0, 10), padx=5)
-            self.keys_drawer_visible = True
-            self.btn_key_status.configure(text=f"🔑 密钥就绪 ({self.key_count}个) ▴")
             self._render_keys_drawer_items()
+        else:
+            self.keys_drawer.grid_forget()
+        arrow = '▴' if self.keys_drawer_visible else '▾'
+        self.btn_key_status.configure(text=f"🔑 密钥就绪 ({self.key_count}个) {arrow}")
 
     def _render_keys_drawer_items(self):
         """渲染抽屉内的 16 个密钥详情项"""
@@ -370,11 +379,15 @@ class WeChatAssistantApp(ctk.CTk):
             command=lambda k=enc_key, n=db_rel: self._copy_key_to_clipboard(k, n)
         ).pack(side="right", padx=5)
 
+    def _copy_to_clipboard(self, text: str, tip_title: str, tip_msg: str):
+        """通用剪贴板复制辅助函数"""
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        messagebox.showinfo(tip_title, tip_msg)
+
     def _copy_key_to_clipboard(self, key_str: str, db_name: str):
         """复制指定数据库的密钥到剪贴板"""
-        self.clipboard_clear()
-        self.clipboard_append(key_str)
-        messagebox.showinfo("已复制", f"已成功复制【{db_name}】的 64 位数据库密钥！")
+        self._copy_to_clipboard(key_str, "已复制", f"已成功复制【{db_name}】的 64 位数据库密钥！")
 
     def _build_action_bar(self, parent):
         """顶部操作工具栏：增量总结触发、默认不自动写入文档开关、打开文档"""
@@ -414,13 +427,11 @@ class WeChatAssistantApp(ctk.CTk):
 
     def _on_auto_save_toggled(self):
         """持久化记忆自动写入今日文档的偏好设置"""
-        cfg = load_full_config()
-        cfg["auto_save_to_doc"] = self.auto_save_var.get()
-        save_full_config(cfg)
+        update_full_config(auto_save_to_doc=self.auto_save_var.get())
 
     def _build_output_tabs(self, parent):
         """构建分离的选项卡：Tab 1 总结成果，Tab 2 运行过程日志"""
-        self.output_tabview = ctk.CTkTabview(parent, corner_radius=10)
+        self.output_tabview = ctk.CTkTabview(parent, corner_radius=10, command=self._on_output_tab_changed)
         self.output_tabview.grid(row=4, column=0, sticky="nsew", padx=5, pady=(0, 5))
 
         tab_results = self.output_tabview.add("✨ AI 总结成果")
@@ -429,6 +440,14 @@ class WeChatAssistantApp(ctk.CTk):
 
         self._build_results_tab(tab_results)
         self._build_logs_tab(tab_logs)
+
+    def _on_output_tab_changed(self):
+        """切换选项卡时：如果切换到日志标签页，自动滚动至最新位置"""
+        if self.output_tabview.get() == "📋 运行过程日志":
+            try:
+                self.txt_summary_log._textbox.see("end")
+            except Exception:
+                pass
 
     def _build_results_tab(self, tab):
         """构建 AI 总结成果展示选项卡 (排版舒适、大号微软雅黑)"""
@@ -489,13 +508,18 @@ class WeChatAssistantApp(ctk.CTk):
         if not content:
             messagebox.showinfo("提示", "当前暂无总结成果可复制。")
             return
-        self.clipboard_clear()
-        self.clipboard_append(content)
-        messagebox.showinfo("成功", "已将全部 AI 总结成果复制到剪贴板！")
+        self._copy_to_clipboard(content, "成功", "已将全部 AI 总结成果复制到剪贴板！")
 
     def _clear_summary_results(self):
-        """清空成果面板"""
+        """清空成果面板并同步清理已解码的图片临时缓存"""
         self.txt_summary_result.delete("1.0", "end")
+        try:
+            from wechat_cli.core.image_decoder import clear_image_cache
+            count = clear_image_cache()
+            if count > 0:
+                self._log_summary(f"🧹 已清空成果面板，并同步删除 {count} 张临时缓存图片。")
+        except Exception:
+            pass
 
     def _clear_summary_log(self):
         """清空日志面板"""
@@ -537,11 +561,11 @@ class WeChatAssistantApp(ctk.CTk):
         self.result_queue.put(item)
 
     def _process_queues(self):
-        """定时消费日志与成果队列：严格锁定视口，绝不自动滑到底部"""
-        # 1. 处理技术日志
+        """定时消费日志与成果队列：日志自动滚到最新底部，AI总结成果严格锁定阅读视口"""
+        # 1. 处理技术日志 (实时追加并自动滑到最新最底部)
         while not self.log_queue.empty():
             msg = self.log_queue.get_nowait()
-            safe_textbox_append(self.txt_summary_log, msg + "\n")
+            log_textbox_append(self.txt_summary_log, msg + "\n")
             # 实时更新简明进度条
             if "正在拉取" in msg or "正在全量分析" in msg or "重点总结已提炼完成" in msg:
                 clean_msg = msg.strip().replace("\n", " ")
@@ -549,15 +573,16 @@ class WeChatAssistantApp(ctk.CTk):
                     clean_msg = clean_msg[:60] + "..."
                 self.lbl_live_status.configure(text=clean_msg, text_color=("blue", "#38BDF8"))
 
-        # 2. 处理 AI 提炼成果
+        # 2. 处理 AI 提炼成果 (锁定视口，用户看到哪就停留在哪，不强制滚到底部)
         while not self.result_queue.empty():
             item = self.result_queue.get_nowait()
+            body = item['summary'].strip()
             sep = "=" * 55
             card = (
                 f"\n{sep}\n"
                 f"📌 [{item['index']}/{item['total']}] 【{item['chat_name']}】重点总结 (新增 {item['count']} 条发言)\n"
                 f"{sep}\n\n"
-                f"{item['summary'].strip()}\n\n"
+                f"{body}\n\n"
             )
             safe_textbox_append(self.txt_summary_result, card)
 
@@ -678,7 +703,7 @@ class WeChatAssistantApp(ctk.CTk):
 
         def worker():
             def log(m):
-                self.after(0, lambda: safe_textbox_append(self.txt_keys_log, m + "\n"))
+                self.after(0, lambda: log_textbox_append(self.txt_keys_log, m + "\n"))
 
             log("正在检查微信客户端运行状态...")
             kwargs = get_subprocess_flags()
@@ -749,9 +774,9 @@ class WeChatAssistantApp(ctk.CTk):
 
         buttons = [
             ("➕ 手动添加", 95, "#2563EB", self._add_group_from_entry),
-            ("☑️ 全选", 70, ("gray75", "gray30"), self._select_all_groups),
-            ("⬜ 全不选", 75, ("gray75", "gray30"), self._unselect_all_groups),
-            ("💾 保存清单", 90, "#2563EB", self._save_groups_manually),
+            ("☑️ 全选", 70, ("gray75", "gray30"), lambda: self._toggle_all_groups(True)),
+            ("⬜ 全不选", 75, ("gray75", "gray30"), lambda: self._toggle_all_groups(False)),
+            ("💾 保存清单", 90, "#2563EB", lambda: self._save_groups(notify=True)),
         ]
         for txt, w, fg, cmd in buttons:
             kw = {"fg_color": fg} if fg else {}
@@ -784,7 +809,7 @@ class WeChatAssistantApp(ctk.CTk):
             width=220
         )
         self.ent_search_discovered.pack(side="left", padx=12)
-        self.ent_search_discovered.bind("<KeyRelease>", lambda e: self._on_search_key_release())
+        self.ent_search_discovered.bind("<KeyRelease>", lambda e: self._filter_and_render_discovered())
 
         btn_fetch_all = ctk.CTkButton(
             disc_header,
@@ -871,15 +896,15 @@ class WeChatAssistantApp(ctk.CTk):
             command=lambda n=name: self._remove_group(n)
         ).pack(side="right", padx=5)
 
-    def _save_groups_quietly(self):
-        """静默持久化配置"""
-        cfg = load_full_config()
-        cfg["monitored_groups"] = self.configured_groups
-        save_full_config(cfg)
+    def _save_groups(self, notify: bool = False):
+        """持久化保存群聊清单配置"""
+        update_full_config(monitored_groups=self.configured_groups)
+        if notify:
+            messagebox.showinfo("成功", "监控群聊清单已成功保存！增量总结将精准生效。")
 
     def _sync_groups_state(self):
         """统一持久化群聊配置并同步更新所有相关视图"""
-        self._save_groups_quietly()
+        self._save_groups(notify=False)
         self._render_configured_groups()
         self._refresh_summary_status()
         self._filter_and_render_discovered()
@@ -923,17 +948,6 @@ class WeChatAssistantApp(ctk.CTk):
             g["enabled"] = enabled
         self._sync_groups_state()
 
-    def _select_all_groups(self):
-        self._toggle_all_groups(True)
-
-    def _unselect_all_groups(self):
-        self._toggle_all_groups(False)
-
-    def _save_groups_manually(self):
-        """手动点击保存按钮"""
-        self._save_groups_quietly()
-        messagebox.showinfo("成功", "监控群聊清单已成功保存！增量总结将精准生效。")
-
     def _fetch_all_wechat_groups(self, force: bool = False):
         """从微信本地数据库读取活跃群聊并直接列出"""
         for w in self.scroll_discovered_groups.winfo_children():
@@ -968,10 +982,6 @@ class WeChatAssistantApp(ctk.CTk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_search_key_release(self):
-        """实时按键搜索过滤"""
-        self._filter_and_render_discovered()
-
     def _filter_and_render_discovered(self):
         """按搜索词过滤并渲染下方的微信活跃群列表"""
         kw = self.ent_search_discovered.get().strip().lower()
@@ -986,10 +996,6 @@ class WeChatAssistantApp(ctk.CTk):
             filtered = self.cached_wechat_groups
 
         self._display_discovered_groups(filtered)
-
-    def _on_select_group_to_monitor(self, name: str):
-        """一键选择加入监控"""
-        self._add_group_direct(name, show_popup=False)
 
     def _display_discovered_groups(self, groups: list):
         """渲染从微信读取到的群聊列表，支持上下滑动与一键选择加入"""
@@ -1059,7 +1065,7 @@ class WeChatAssistantApp(ctk.CTk):
             ctk.CTkButton(
                 row, text="➕ 选择加入监控", font=ctk.CTkFont(family=FONT_FAMILY_MAIN, size=12, weight="bold"),
                 width=115, height=28, fg_color="#2563EB", hover_color="#1D4ED8", cursor="hand2",
-                command=lambda name=chat_name: self._on_select_group_to_monitor(name)
+                command=lambda name=chat_name: self._add_group_direct(name, show_popup=False)
             ).pack(side="right", padx=8, pady=4)
 
     # =========================================================================
@@ -1159,10 +1165,10 @@ class WeChatAssistantApp(ctk.CTk):
         self.ent_api_key.insert(0, key)
 
     def _save_ai_config(self):
-        cfg = load_full_config()
-        cfg["ai_api_url"] = self.ent_api_url.get().strip()
-        cfg["ai_api_key"] = self.ent_api_key.get().strip()
-        save_full_config(cfg)
+        update_full_config(
+            ai_api_url=self.ent_api_url.get().strip(),
+            ai_api_key=self.ent_api_key.get().strip()
+        )
         self._refresh_summary_status()
         messagebox.showinfo("成功", "AI 模型配置已更新成功！")
 
@@ -1196,7 +1202,7 @@ class WeChatAssistantApp(ctk.CTk):
         self.scroll_files = ctk.CTkScrollableFrame(split_frame, width=220, corner_radius=10)
         self.scroll_files.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
 
-        self.txt_history_preview = ctk.CTkTextbox(split_frame, corner_radius=10, font=ctk.CTkFont(family="Consolas", size=13), wrap="word")
+        self.txt_history_preview = ctk.CTkTextbox(split_frame, corner_radius=10, font=ctk.CTkFont(family=FONT_FAMILY_MONO, size=13), wrap="word")
         self.txt_history_preview.grid(row=0, column=1, sticky="nsew")
 
         def on_show():
@@ -1241,14 +1247,12 @@ class WeChatAssistantApp(ctk.CTk):
 
     def _preview_file(self, fname: str):
         full_path = os.path.join(SUMMARIES_DIR, fname)
+        self.txt_history_preview.delete("1.0", "end")
         if os.path.exists(full_path):
             try:
                 with open(full_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                self.txt_history_preview.delete("1.0", "end")
-                self.txt_history_preview.insert("1.0", content)
+                    self.txt_history_preview.insert("1.0", f.read())
             except Exception as e:
-                self.txt_history_preview.delete("1.0", "end")
                 self.txt_history_preview.insert("1.0", f"读取失败: {str(e)}")
 
     # =========================================================================
@@ -1303,20 +1307,16 @@ class WeChatAssistantApp(ctk.CTk):
 
     def _purge_privacy_data(self, include_config: bool = False):
         """统一执行隐私数据物理粉碎（密钥、时间戳、历史总结、Windows 定时任务）"""
-        user_dir = os.path.expanduser("~/.wechat-cli")
-        if os.path.exists(user_dir):
-            shutil.rmtree(user_dir, ignore_errors=True)
+        for p in [os.path.expanduser("~/.wechat-cli"), SUMMARIES_DIR]:
+            shutil.rmtree(p, ignore_errors=True)
         if os.path.exists(LAST_SYNC_FILE):
             os.remove(LAST_SYNC_FILE)
-        if os.path.exists(SUMMARIES_DIR):
-            shutil.rmtree(SUMMARIES_DIR, ignore_errors=True)
         if include_config and os.path.exists(CONFIG_FILE):
             try:
                 os.remove(CONFIG_FILE)
             except Exception:
                 pass
-        kwargs = get_subprocess_flags()
-        subprocess.run(["schtasks", "/delete", "/tn", "微信群定时增量总结", "/f"], capture_output=True, **kwargs)
+        subprocess.run(["schtasks", "/delete", "/tn", "微信群定时增量总结", "/f"], capture_output=True, **get_subprocess_flags())
         self._refresh_summary_status()
 
     def _do_cleanup_level_1(self):
@@ -1325,10 +1325,13 @@ class WeChatAssistantApp(ctk.CTk):
         if os.path.exists(LAST_SYNC_FILE):
             os.remove(LAST_SYNC_FILE)
         user_dir = os.path.expanduser("~/.wechat-cli")
-        for sub in ["decrypted", "decoded_images"]:
-            p = os.path.join(user_dir, sub)
-            if os.path.exists(p):
-                shutil.rmtree(p, ignore_errors=True)
+        for sub in ["decrypted", "decoded_images", "cache"]:
+            shutil.rmtree(os.path.join(user_dir, sub), ignore_errors=True)
+        try:
+            from wechat_cli.core.image_decoder import clear_image_cache
+            clear_image_cache()
+        except Exception:
+            pass
         messagebox.showinfo("完成", "等级 1 清理完成！微信解密密钥仍保留，下次运行将重新抓取。")
         self._refresh_summary_status()
 

@@ -24,9 +24,7 @@ if sys.stdin is not None and hasattr(sys.stdin, 'reconfigure'):
 
 # 根目录与路径定义（自适应源码与 Nuitka 二进制编译模式）
 def get_base_dir() -> str:
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
-    if "__compiled__" in globals():
+    if getattr(sys, 'frozen', False) or "__compiled__" in globals():
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
@@ -46,6 +44,23 @@ def get_subprocess_flags() -> dict:
     return {}
 
 
+def load_json_file(file_path: str, default=None):
+    """安全读取 JSON 文件的通用辅助函数"""
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return default if default is not None else {}
+
+
+def save_json_file(file_path: str, data):
+    """安全写入 JSON 文件的通用辅助函数"""
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
 def load_full_config() -> dict:
     """动态读取用户完整配置，包含群列表、保存偏好等"""
     cfg = {
@@ -55,34 +70,28 @@ def load_full_config() -> dict:
         "ai_api_url": "https://api.deepseek.com/chat/completions",
         "ai_api_key": os.getenv("AI_API_KEY", "")
     }
-
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                user_data = json.load(f)
-                cfg.update(user_data)
-        except Exception:
-            pass
+    cfg.update(load_json_file(CONFIG_FILE, {}))
 
     # 若未设置具体监控群，但存在历史同步记录，则自动初始化具体群名单
-    if not cfg.get("monitored_groups") and os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                state_data = json.load(f)
-                if state_data:
-                    cfg["monitored_groups"] = [
-                        {"name": k, "enabled": True} for k in state_data.keys()
-                    ]
-        except Exception:
-            pass
+    if not cfg.get("monitored_groups"):
+        state_data = load_json_file(STATE_FILE, {})
+        if state_data:
+            cfg["monitored_groups"] = [{"name": k, "enabled": True} for k in state_data.keys()]
 
     return cfg
 
 
 def save_full_config(cfg: dict):
     """保存用户完整配置"""
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    save_json_file(CONFIG_FILE, cfg)
+
+
+def update_full_config(**kwargs) -> dict:
+    """更新并持久化保存用户配置项"""
+    cfg = load_full_config()
+    cfg.update(kwargs)
+    save_full_config(cfg)
+    return cfg
 
 
 def load_user_config():
@@ -102,19 +111,12 @@ def get_today_doc_path() -> str:
 
 def load_state() -> dict:
     """加载各个群上次同步的最后时间戳"""
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+    return load_json_file(STATE_FILE, {})
 
 
 def save_state(state: dict):
     """保存时间戳状态"""
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+    save_json_file(STATE_FILE, state)
 
 
 def run_cli_command(args: list) -> str:
@@ -165,22 +167,14 @@ def get_target_sessions():
     }
 
     target_sessions = []
+    patterns = cfg.get("group_patterns", ["*北京移动*"])
     for s in sessions:
-        if not s.get("is_group"):
+        chat = s.get("chat", "").strip()
+        if not s.get("is_group") or not chat:
             continue
-        chat_name = s.get("chat", "").strip()
-        if not chat_name:
-            continue
-
-        if enabled_names:
-            # 模式 A：具体群精准匹配
-            if chat_name in enabled_names:
-                target_sessions.append(s)
-        else:
-            # 模式 B：模糊通配符匹配
-            patterns = cfg.get("group_patterns", ["*北京移动*"])
-            if any(fnmatch(chat_name, pattern) for pattern in patterns):
-                target_sessions.append(s)
+        matched = (chat in enabled_names) if enabled_names else any(fnmatch(chat, p) for p in patterns)
+        if matched:
+            target_sessions.append(s)
 
     return target_sessions
 
@@ -224,15 +218,8 @@ def fetch_new_messages(chat_name: str, last_ts: int) -> list:
         except Exception:
             break
 
-    if not all_batches:
-        return []
-
-    # history 批次从前往后是按最新倒序拉取的，反转各批次后拼接恢复从早到晚的时间正序
-    all_messages = []
-    for b in reversed(all_batches):
-        all_messages.extend(b)
-
-    return all_messages
+    # history 批次从前往后是按最新倒序拉取的，反转各批次恢复从早到晚的时间正序
+    return [m for b in reversed(all_batches) for m in b]
 
 
 def clean_messages(raw_messages: list) -> list:
@@ -265,7 +252,17 @@ def clean_messages(raw_messages: list) -> list:
         msg = re.sub(r'↳ 回复 .*?: <\?xml.*', '', msg).strip()
         msg = re.sub(r'\s+', ' ', msg).strip()
 
-        # 4. 提取发言内容正文判断是否有价值
+        # 4. 自动解码图片：为 AI 深入阅读附图内容提供路径，未解码或缺失则净化为干净的 [图片]
+        img_match = re.search(r'\[图片\]\s*([^\s\r\n\t]+)', msg)
+        if img_match:
+            raw_path = img_match.group(1).strip()
+            decoded = try_decode_image(raw_path)
+            if decoded and os.path.isfile(decoded) and not decoded.lower().endswith('.dat'):
+                msg = msg.replace(raw_path, f"[附图待读: {decoded}]")
+            else:
+                msg = re.sub(r'\[图片\].*', '[图片]', msg)
+
+        # 5. 提取发言内容正文判断是否有价值
         content = msg.split(":", 1)[-1].strip() if ":" in msg else msg
         if content in NOISE_PHRASES or len(content) < 2:
             continue
@@ -274,16 +271,41 @@ def clean_messages(raw_messages: list) -> list:
     return cleaned
 
 
+def try_decode_image(path: str) -> str:
+    """尝试将 .dat 路径转换为真实图片路径"""
+    if path and path.lower().endswith('.dat'):
+        try:
+            from wechat_cli.core.image_decoder import decode_dat_file
+            decoded = decode_dat_file(path)
+            if decoded and os.path.isfile(decoded):
+                return decoded
+        except Exception:
+            pass
+    return path
+
+
+def clean_summary_output(summary: str) -> str:
+    """深度清洗总结输出：剔除泄露的本地临时路径与无实质内容的‘分享了图片’机械表述"""
+    if not summary:
+        return summary
+    lines = []
+    for line in summary.splitlines():
+        # 过滤包含本地临时文件路径的行 (如 .dat / .jpg / file:///)
+        if re.search(r'(?:file:///|[a-zA-Z]:[\\/])[^\s\r\n\t`"\'\)\]]+\.(?:dat|jpg|jpeg|png)', line, re.I):
+            continue
+        # 过滤机械无营养的“某某分享了图片/截图”描述行
+        if re.search(r'分享了\s*\d*\s*张.*(?:图片|截图)', line):
+            continue
+        if re.search(r'^\s*[*#-]*\s*(?:\*\*)?(?:图片资料|分享的资料/链接/图片)(?:\*\*)?[:：]?\s*$', line):
+            continue
+        lines.append(line)
+    cleaned = "\n".join(lines).strip()
+    return cleaned if cleaned else summary
+
+
 def get_stored_keys() -> dict:
     """读取本地已提取并保存的微信数据库密钥字典"""
-    keys_file = os.path.expanduser("~/.wechat-cli/all_keys.json")
-    if os.path.exists(keys_file):
-        try:
-            with open(keys_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+    return load_json_file(os.path.expanduser("~/.wechat-cli/all_keys.json"), {})
 
 
 def get_ai_engine_desc(cfg: dict = None) -> str:
@@ -302,15 +324,20 @@ def get_ai_engine_desc(cfg: dict = None) -> str:
 
 
 def build_summary_prompt(chat_name: str, messages: list) -> str:
-    """构建用于大模型提炼的结构化总结 Prompt，消除多处硬编码冗余"""
+    """构建用于大模型深度提炼的结构化总结 Prompt"""
     return (
-        f"你是一名专业的信息分析专家。下面是微信群【{chat_name}】近期的增量原始发言记录。\n"
-        f"请彻底过滤闲聊水话，直接输出高密度、有实质价值的要点提炼。\n"
-        f"注意：直接根据下方文本结构化输出文字总结，不要调用任何工具：\n\n"
-        f"1. 💡【核心议题与结论】：群友在讨论什么业务、资费套餐、优惠活动或操作细节？结论是什么？\n"
-        f"2. 📌【关键信息与待办预警】：有什么重要的注意事项、资费变动、待办节点或避坑提醒？\n"
-        f"3. 🔗【分享的资料/链接/图片】：若有分享群资料或图片，列出要点（若无则写“无”）。\n\n"
-        f"聊天记录如下：\n"
+        f"你是一名专业高效的信息分析专家。下面是微信群【{chat_name}】近期的增量原始发言记录。\n"
+        f"核心任务：\n"
+        f"1. 深度提炼高价值干货，将群友讨论对话与图片表达的业务要点融为一体进行总结。\n"
+        f"2. 若发言中包含 `[附图待读: <本地图片路径>]`，请使用 read_file 工具读取该图片，深入理解其中包含的资费方案、活动细则、通知告示等实质内容。\n"
+        f"3. 严禁在总结中输出任何本地文件路径（如 .dat、.jpg、file:/// 等）。\n"
+        f"4. 不要出现‘某某分享了图片’、‘有一张截图’等机械废话，不要单独列出图片列表，直接融合输出对话与图片表达的核心内容。\n\n"
+        f"请按以下结构直接输出纯净 Markdown 总结：\n"
+        f"### 💡【核心议题与结论】\n"
+        f"（群友在讨论什么业务套餐、活动规则或焦点问题？结合对话与图片，得出的具体结论是什么？）\n\n"
+        f"### 📌【关键信息与待办预警】\n"
+        f"（有什么具体的办理资格、互斥限制、优惠时间节点、避坑提醒或注意事项？）\n\n"
+        f"聊天发言记录如下：\n"
         + "\n".join(messages)
     )
 
@@ -378,7 +405,7 @@ def call_agy_cli(chat_name: str, messages: list) -> tuple:
     prompt = build_summary_prompt(chat_name, messages)
     print(f"⏳ 正在调用官方 agy CLI (Gemini 3.8 Flash) 提炼总结 (约需 3~10 秒，请稍候)...", flush=True)
     try:
-        cmd = [agy_path, "--model", "gemini-3.8-flash-high", "-p", prompt]
+        cmd = [agy_path, "--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions", "-p", prompt]
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         kwargs = get_subprocess_flags()
@@ -393,13 +420,11 @@ def call_agy_cli(chat_name: str, messages: list) -> tuple:
             print(f"❌ [agy CLI 调用失败]: {err_msg[:200]}")
             return None, err_msg[:200]
     except subprocess.TimeoutExpired:
-        err_msg = "agy 响应超时 (超过 60 秒)"
-        print(f"❌ [agy CLI 超时]: {err_msg}")
-        return None, err_msg
+        print("❌ [agy CLI 超时]: 响应超时 (超过 60 秒)")
+        return None, "agy 响应超时 (超过 60 秒)"
     except Exception as e:
-        err_msg = f"agy 调用异常: {e}"
-        print(f"❌ [agy CLI 异常]: {err_msg}")
-        return None, err_msg
+        print(f"❌ [agy CLI 异常]: {e}")
+        return None, f"agy 调用异常: {e}"
 
 
 def get_antigravity_exe() -> str:
@@ -470,14 +495,11 @@ def _build_offline_fallback_summary(messages: list, last_error: str = None) -> s
     """未配置 Key 或 AI 失败时的离线完整简报（杜绝 XML 垃圾，不设截断）"""
     meaningful_texts = []
     links = []
-    images = 0
 
     for m in messages:
         if "[分享卡片]" in m or "[链接/文件]" in m:
             links.append(m.split(":", 1)[-1].strip())
-        elif "[图片" in m:
-            images += 1
-        else:
+        elif "[图片" not in m:
             content = m.split(":", 1)[-1].strip()
             if len(content) >= 4:
                 meaningful_texts.append(m)
@@ -492,8 +514,6 @@ def _build_offline_fallback_summary(messages: list, last_error: str = None) -> s
         res.append("• 资料/卡片分享链接：")
         for link in links:
             res.append(f"  - {link}")
-    if images:
-        res.append(f"• 图片分享：共 {images} 张")
 
     return "\n".join(res)
 
@@ -504,31 +524,36 @@ def _summarize_single_chunk(chat_name: str, messages: list) -> str:
         return "无新消息。"
 
     last_error = None
+    res = None
 
     # 1. 优先调用官方 agy CLI (-p) 驱动（免 API Key，直接白嫖本地 Gemini Flash）！
     if get_agy_path():
         agy_res, agy_err = call_agy_cli(chat_name, messages)
         if agy_res:
-            return agy_res
-        last_error = f"官方 agy 报错: {agy_err}"
+            res = agy_res
+        else:
+            last_error = f"官方 agy 报错: {agy_err}"
 
     # 2. 备用调用本地 Antigravity 内部 language_server CLI
-    if get_antigravity_exe():
+    if not res and get_antigravity_exe():
         print(f"正在尝试调用备用 Antigravity 引擎进行智能提炼...", flush=True)
         agy_summary = call_antigravity_cli(chat_name, messages)
         if agy_summary:
-            return agy_summary
+            res = agy_summary
 
     # 3. 如果本地 CLI 未就绪且配置了外部 API Key，则调外部 API
-    if AI_API_KEY:
+    if not res and AI_API_KEY:
         try:
-            return call_llm_api(chat_name, messages)
+            res = call_llm_api(chat_name, messages)
         except Exception as e:
             last_error = f"外部 API 异常: {e}"
             print(f"[⚠️ 外部 API 调用失败: {e}]，自动降级为清洗模式。")
 
     # 4. 未配置 Key 或 AI 失败时的离线提炼（杜绝 XML 垃圾）
-    return _build_offline_fallback_summary(messages, last_error)
+    if not res:
+        res = _build_offline_fallback_summary(messages, last_error)
+
+    return clean_summary_output(res)
 
 
 def summarize_text(chat_name: str, messages: list) -> str:

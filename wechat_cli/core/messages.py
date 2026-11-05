@@ -222,8 +222,21 @@ def _format_voip_message_text(content):
     return f"[通话] {status_map.get(raw_text, raw_text)}"
 
 
-def _resolve_media_path(db_dir, content, local_type, create_time_ts, chat_username=None):
-    """尝试解析媒体文件在磁盘上的路径。
+def _get_attach_subdirs(attach_dir: str, target_hash: str, date_prefix: str, sub_name: str) -> list:
+    """提取 attach 目录下指定子类型路径列表，消除重复检索代码"""
+    if not os.path.isdir(attach_dir):
+        return []
+    targets = [target_hash] if target_hash and os.path.isdir(os.path.join(attach_dir, target_hash)) else [
+        d for d in os.listdir(attach_dir) if os.path.isdir(os.path.join(attach_dir, d))
+    ]
+    return [
+        os.path.join(attach_dir, d, date_prefix, sub_name)
+        for d in targets if os.path.isdir(os.path.join(attach_dir, d, date_prefix, sub_name))
+    ]
+
+
+def _resolve_media_path(db_dir, content, local_type, create_time_ts, chat_username=None, local_id=None):
+    """尝试解析媒体文件在磁盘上的路径。图片会自动解密为可直接查看的 jpg/png 格式。
 
     Args:
         db_dir: 微信 db_storage 目录
@@ -231,6 +244,7 @@ def _resolve_media_path(db_dir, content, local_type, create_time_ts, chat_userna
         local_type: 消息类型
         create_time_ts: 消息时间戳
         chat_username: 聊天对象 username（用于定位 attach 子目录）
+        local_id: 消息本地自增 ID
 
     Returns:
         (path, exists) 元组，path 为 None 表示无法解析
@@ -267,40 +281,49 @@ def _resolve_media_path(db_dir, content, local_type, create_time_ts, chat_userna
                                     return os.path.join(file_dir, f), True
         return None, False
 
-    # 图片消息 (type 3): msg/attach/<hash>/YYYY-MM/Img/*.dat
-    # 视频/语音消息: msg/video/YYYY-MM/ 或 msg/attach/
-    if base_type in (3, 34, 43):
-        # 搜索 attach 目录下对应月份的文件
+    # 图片消息 (type 3): 尝试定位解密后的图像或原生缩略图
+    if base_type == 3:
+        target_hash = hashlib.md5(chat_username.encode()).hexdigest() if chat_username else None
+        # 1. 优先检查微信原生的未加密缩略图 (cache/YYYY-MM/Message/<hash>/Thumb/)
+        if target_hash and local_id:
+            cache_thumb = os.path.join(wechat_base, "cache", date_prefix, "Message", target_hash, "Thumb", f"{local_id}_{create_time_ts}_thumb.jpg")
+            if os.path.isfile(cache_thumb):
+                return cache_thumb, True
+
+        # 2. 从 attach 目录寻找并自动解密 .dat 文件
         attach_dir = os.path.join(msg_dir, "attach")
-        if not os.path.isdir(attach_dir):
-            return None, False
+        if os.path.isdir(attach_dir):
+            md5_cands = re.findall(r'[a-fA-F0-9]{32}', content) if content else []
+            from .image_decoder import decode_dat_file
 
-        # 尝试用 chat_username 的 MD5 匹配 attach 子目录
-        target_hash = None
-        if chat_username:
-            h = hashlib.md5(chat_username.encode()).hexdigest()
-            candidate = os.path.join(attach_dir, h)
-            if os.path.isdir(candidate):
-                target_hash = h
+            for sub in _get_attach_subdirs(attach_dir, target_hash, date_prefix, "Img"):
+                target_dat = None
+                for cand in md5_cands:
+                    for ext in (f"{cand}.dat", f"{cand}_t.dat"):
+                        p = os.path.join(sub, ext)
+                        if os.path.isfile(p):
+                            target_dat = p
+                            break
+                    if target_dat:
+                        break
+                if not target_dat:
+                    files = [f for f in os.listdir(sub) if not f.endswith("_h.dat") and f.endswith(".dat")]
+                    if files:
+                        files.sort(key=lambda fn: abs(os.path.getmtime(os.path.join(sub, fn)) - create_time_ts))
+                        target_dat = os.path.join(sub, files[0])
+                if target_dat:
+                    return decode_dat_file(target_dat, attach_dir=attach_dir), True
 
-        # 限定搜索范围：目标目录或所有目录
-        search_dirs = [target_hash] if target_hash else [
-            d for d in os.listdir(attach_dir)
-            if os.path.isdir(os.path.join(attach_dir, d))
-        ]
-
-        sub_dir_name = "Img" if base_type == 3 else ("Video" if base_type == 43 else "Voice")
-
-        for d in search_dirs:
-            sub = os.path.join(attach_dir, d, date_prefix, sub_dir_name)
-            if os.path.isdir(sub):
+    # 视频/语音消息: msg/video/YYYY-MM/ 或 msg/attach/
+    if base_type in (34, 43):
+        attach_dir = os.path.join(msg_dir, "attach")
+        if os.path.isdir(attach_dir):
+            sub_dir_name = "Video" if base_type == 43 else "Voice"
+            for sub in _get_attach_subdirs(attach_dir, target_hash, date_prefix, sub_dir_name):
                 files = [f for f in os.listdir(sub) if not f.endswith("_h.dat")]
                 if files:
-                    # 返回目录路径（具体是哪个文件无法从 XML 精确匹配）
-                    sample = files[0]
-                    return os.path.join(sub, sample), True
+                    return os.path.join(sub, files[0]), True
 
-        # 视频：也检查 msg/video/
         if base_type == 43:
             video_dir = os.path.join(msg_dir, "video", date_prefix)
             if os.path.isdir(video_dir):
@@ -320,19 +343,13 @@ def _format_message_text(local_id, local_type, content, is_group, chat_username,
     if resolve_media and db_dir and content:
         try:
             media_path, media_exists = _resolve_media_path(
-                db_dir, content, local_type, create_time_ts, chat_username
+                db_dir, content, local_type, create_time_ts, chat_username, local_id=local_id
             )
         except Exception:
             pass
 
     if base_type == 3:
-        if media_path:
-            tag = f"[图片] {media_path}"
-            if not media_exists:
-                tag += " (文件不存在)"
-        else:
-            tag = f"[图片] (local_id={local_id})"
-        text = tag
+        text = f"[图片] {media_path}" if (media_path and media_exists) else "[图片]"
     elif base_type == 47:
         text = "[表情]"
     elif base_type == 50:
