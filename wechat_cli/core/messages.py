@@ -164,11 +164,17 @@ def _format_app_message_text(content, local_type, is_group, chat_username, chat_
 
     if app_type == 57:
         ref = appmsg.find('.//refermsg')
-        ref_content = ''
-        ref_display_name = ''
+        ref_content, ref_display_name = '', ''
         if ref is not None:
             ref_display_name = (ref.findtext('displayname') or '').strip()
-            ref_content = _collapse_text(ref.findtext('content') or '')
+            raw = ref.findtext('content') or ''
+            t_match = re.search(r'<title>(.*?)</title>', raw)
+            if t_match:
+                ref_content = _collapse_text(t_match.group(1))
+            elif '<' in raw and '>' in raw:
+                ref_content = _collapse_text(re.sub(r'<[^>]+>', '', raw))
+            else:
+                ref_content = _collapse_text(raw)
         if len(ref_content) > 160:
             ref_content = ref_content[:160] + "..."
         quote_text = title or "[引用消息]"

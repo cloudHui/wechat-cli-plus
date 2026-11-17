@@ -719,7 +719,7 @@ class WeChatAssistantApp(ctk.CTk):
                 from click.testing import CliRunner
                 from wechat_cli.main import cli as wechat_cli_app
                 runner = CliRunner()
-                res = runner.invoke(wechat_cli_app, ["init"])
+                res = runner.invoke(wechat_cli_app, ["init", "--force"])
                 log(res.output if res.output else "[无输出]")
                 if res.exit_code == 0:
                     log("✅ 微信解密密钥提取完成！")

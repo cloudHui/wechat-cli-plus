@@ -235,8 +235,8 @@ def clean_messages(raw_messages: list) -> list:
         if "<sysmsg" in msg or "撤回了一条消息" in msg or "拍了拍" in msg:
             continue
 
-        # 2. 如果包含 XML 卡片或图文消息，提取其中的核心标题或纯文本
-        if "<?xml" in msg or "<msg" in msg:
+        # 2. 如果包含 XML 卡片或图文消息（非引用回复消息），提取其中的核心标题或纯文本
+        if ("<?xml" in msg or "<msg" in msg) and "↳ 回复" not in msg:
             # 尝试提取分享链接的标题 <title>...</title>
             title_match = re.search(r'<title>(.*?)</title>', msg)
             if title_match:
@@ -248,8 +248,9 @@ def clean_messages(raw_messages: list) -> list:
                 # 剔除纯图片 XML 乱码
                 msg = re.sub(r'<\?xml.*', '[图片/多媒体]', msg).strip()
 
-        # 3. 清洗回复引用的多余空行与 XML
-        msg = re.sub(r'↳ 回复 .*?: <\?xml.*', '', msg).strip()
+        # 3. 清洗回复引用残留标签与多余空白
+        if "↳ 回复" in msg:
+            msg = re.sub(r'<[^>]+>', '', msg)
         msg = re.sub(r'\s+', ' ', msg).strip()
 
         # 4. 自动解码图片：为 AI 深入阅读附图内容提供路径，未解码或缺失则净化为干净的 [图片]
@@ -342,7 +343,7 @@ def build_summary_prompt(chat_name: str, messages: list) -> str:
     )
 
 
-def _http_post_json(url: str, payload: dict, headers: dict, timeout: int = 40) -> dict:
+def _http_post_json(url: str, payload: dict, headers: dict, timeout: int = 120) -> dict:
     """通用 JSON POST 请求辅助函数，消除网络请求样板代码"""
     import urllib.request
     data = json.dumps(payload).encode("utf-8")
@@ -394,6 +395,19 @@ def get_agy_path() -> str:
     return None
 
 
+MAX_CLI_PROMPT_CHARS = 15000
+DEFAULT_AGY_MODEL = "gemini-3.8-flash-medium"
+
+
+def _write_prompt_temp_file(prompt: str) -> str:
+    """将超长 Prompt 写入临时文件，规避 Windows 命令行 32KB 长度限制"""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    temp_path = os.path.join(OUTPUT_DIR, f".tmp_prompt_{os.getpid()}_{int(time.time() * 1000)}.txt")
+    with open(temp_path, "w", encoding="utf-8") as f:
+        f.write(prompt)
+    return temp_path
+
+
 def call_agy_cli(chat_name: str, messages: list) -> tuple:
     """直接调用官方 agy CLI (-p) 进行深度提炼，免 API Key 极速总结
     返回: (summary_str, error_msg)
@@ -402,14 +416,31 @@ def call_agy_cli(chat_name: str, messages: list) -> tuple:
     if not agy_path:
         return None, "未找到 agy CLI 命令"
 
+    cfg = load_full_config()
+    model_name = cfg.get("agy_model") or DEFAULT_AGY_MODEL
     prompt = build_summary_prompt(chat_name, messages)
-    print(f"⏳ 正在调用官方 agy CLI (Gemini 3.8 Flash) 提炼总结 (约需 3~10 秒，请稍候)...", flush=True)
+    temp_path = None
+    print(f"⏳ 正在调用官方 agy CLI ({model_name}) 提炼总结 (请稍候)...", flush=True)
     try:
-        cmd = [agy_path, "--model", "gemini-3.8-flash-high", "--dangerously-skip-permissions", "-p", prompt]
+        cmd = [
+            agy_path,
+            "--model", model_name,
+            "--disable-slash-commands",
+            "--dangerously-skip-permissions",
+        ]
+        if len(prompt) > MAX_CLI_PROMPT_CHARS:
+            temp_path = _write_prompt_temp_file(prompt)
+            cmd.extend([
+                "--add-dir", OUTPUT_DIR,
+                "-p", f"请使用 read_file 工具读取文件 {temp_path} 中的完整指令与聊天记录，并严格按照要求直接输出纯净 Markdown 总结。",
+            ])
+        else:
+            cmd.extend(["-p", prompt])
+
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         kwargs = get_subprocess_flags()
-        res = subprocess.run(cmd, capture_output=True, env=env, timeout=60, **kwargs)
+        res = subprocess.run(cmd, capture_output=True, env=env, timeout=180, **kwargs)
         if res.returncode == 0:
             text = res.stdout.decode("utf-8", errors="replace").strip()
             if text:
@@ -420,11 +451,17 @@ def call_agy_cli(chat_name: str, messages: list) -> tuple:
             print(f"❌ [agy CLI 调用失败]: {err_msg[:200]}")
             return None, err_msg[:200]
     except subprocess.TimeoutExpired:
-        print("❌ [agy CLI 超时]: 响应超时 (超过 60 秒)")
-        return None, "agy 响应超时 (超过 60 秒)"
+        print("❌ [agy CLI 超时]: 响应超时 (超过 180 秒)")
+        return None, "agy 响应超时 (超过 180 秒)"
     except Exception as e:
         print(f"❌ [agy CLI 异常]: {e}")
         return None, f"agy 调用异常: {e}"
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
 
 def get_antigravity_exe() -> str:
@@ -459,36 +496,49 @@ def call_antigravity_cli(chat_name: str, messages: list) -> str:
         return None
 
     prompt = build_summary_prompt(chat_name, messages)
-    cmd = [exe_path, "agentapi", "new-conversation", "--model=flash", f"--title=微信总结:{chat_name}", prompt]
+    temp_path = None
+    cli_prompt = prompt
+    if len(prompt) > MAX_CLI_PROMPT_CHARS:
+        temp_path = _write_prompt_temp_file(prompt)
+        cli_prompt = f"请使用 read_file 工具读取文件 {temp_path} 中的完整指令与聊天记录，并严格按照要求直接输出纯净 Markdown 总结。"
+
+    cmd = [exe_path, "agentapi", "new-conversation", "--model=flash", f"--title=微信总结:{chat_name}", cli_prompt]
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
+    cid = None
     try:
         kwargs = get_subprocess_flags()
-        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, timeout=20, **kwargs)
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, timeout=30, **kwargs)
         if res.returncode != 0:
             return None
         data = json.loads(res.stdout)
         cid = data.get("response", {}).get("newConversation", {}).get("conversationId")
         if not cid:
             return None
+
+        log_file = os.path.expanduser(f"~/.gemini/antigravity/brain/{cid}/.system_generated/logs/transcript.jsonl")
+        for _ in range(90):
+            if os.path.exists(log_file):
+                try:
+                    with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                        for line in f:
+                            entry = json.loads(line)
+                            # 必须是最终的回答（PLANNER_RESPONSE），且不含工具调用！
+                            if entry.get("source") == "MODEL" and entry.get("type") == "PLANNER_RESPONSE":
+                                if not entry.get("tool_calls") and entry.get("content"):
+                                    return entry["content"].strip()
+                except Exception:
+                    pass
+            time.sleep(1)
+        return None
     except Exception:
         return None
-
-    log_file = os.path.expanduser(f"~/.gemini/antigravity/brain/{cid}/.system_generated/logs/transcript.jsonl")
-    for _ in range(30):
-        if os.path.exists(log_file):
+    finally:
+        if temp_path and os.path.exists(temp_path):
             try:
-                with open(log_file, "r", encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        entry = json.loads(line)
-                        # 必须是最终的回答（PLANNER_RESPONSE），且不含工具调用！
-                        if entry.get("source") == "MODEL" and entry.get("type") == "PLANNER_RESPONSE":
-                            if not entry.get("tool_calls") and entry.get("content"):
-                                return entry["content"].strip()
+                os.remove(temp_path)
             except Exception:
                 pass
-        time.sleep(1)
-    return None
 
 
 def _build_offline_fallback_summary(messages: list, last_error: str = None) -> str:
@@ -556,22 +606,44 @@ def _summarize_single_chunk(chat_name: str, messages: list) -> str:
     return clean_summary_output(res)
 
 
+def _split_messages_into_chunks(messages: list, max_msgs: int = 150, max_chars: int = 15000) -> list:
+    """按消息条数与总字符数双重上限切分批次，防止单批过长导致命令超长或模型超时"""
+    chunks = []
+    current_chunk = []
+    current_chars = 0
+
+    for msg in messages:
+        msg_len = len(msg) + 1
+        if current_chunk and (len(current_chunk) >= max_msgs or current_chars + msg_len > max_chars):
+            chunks.append(current_chunk)
+            current_chunk = []
+            current_chars = 0
+        current_chunk.append(msg)
+        current_chars += msg_len
+
+    if current_chunk:
+        chunks.append(current_chunk)
+    return chunks
+
+
 def summarize_text(chat_name: str, messages: list) -> str:
-    """智能增量总结入口：当消息量极大时自动分批送入大模型，保证完全取完并深度总结"""
+    """智能增量总结入口：当消息量或字符数较大时自动分批送入大模型，保证完全取完并深度总结"""
     if not messages:
         return "无新消息。"
 
-    CHUNK_SIZE = 300
-    if len(messages) <= CHUNK_SIZE:
-        return _summarize_single_chunk(chat_name, messages)
+    chunks = _split_messages_into_chunks(messages, max_msgs=150, max_chars=15000)
+    if len(chunks) == 1:
+        return _summarize_single_chunk(chat_name, chunks[0])
 
-    # 超过 300 条发言时自动切批，分批深度提炼
-    total_chunks = (len(messages) + CHUNK_SIZE - 1) // CHUNK_SIZE
-    print(f"📦 本次捕获增量发言共 {len(messages)} 条，自动切分为 {total_chunks} 批进行全量深度总结...", flush=True)
+    total_chunks = len(chunks)
+    print(f"📦 本次捕获增量发言共 {len(messages)} 条，按条数与字数自动切分为 {total_chunks} 批进行全量深度总结...", flush=True)
     summaries = []
-    for idx in range(total_chunks):
-        chunk = messages[idx * CHUNK_SIZE : (idx + 1) * CHUNK_SIZE]
-        print(f"   ⏳ 正在提炼第 {idx + 1}/{total_chunks} 批 (第 {idx * CHUNK_SIZE + 1}~{min((idx + 1) * CHUNK_SIZE, len(messages))} 条)...", flush=True)
+    processed = 0
+    for idx, chunk in enumerate(chunks):
+        start_no = processed + 1
+        end_no = processed + len(chunk)
+        processed = end_no
+        print(f"   ⏳ 正在提炼第 {idx + 1}/{total_chunks} 批 (第 {start_no}~{end_no} 条)...", flush=True)
         res = _summarize_single_chunk(f"{chat_name} (第{idx+1}批)", chunk)
         summaries.append(f"#### 📑 第 {idx + 1}/{total_chunks} 批提炼总结 (含 {len(chunk)} 条发言):\n\n{res}")
 
@@ -690,8 +762,13 @@ def run_incremental_summary(log_fn=print, ask_save_fn=None, auto_save=None, resu
         raw_msgs = fetch_new_messages(chat_name, last_ts)
         msgs = clean_messages(raw_msgs)
 
+        if not raw_msgs:
+            log_fn(f"[提示] 【{chat_name}】未拉取到新发言记录 (可能处于时间戳同步边缘)")
+            state[chat_name] = current_ts
+            continue
+
         if not msgs:
-            log_fn(f"[提示] 【{chat_name}】无有效文本发言 (全部为撤回或纯表情)")
+            log_fn(f"[提示] 【{chat_name}】共拉取 {len(raw_msgs)} 条，但无有效文本发言 (全部为撤回或纯表情灌水)")
             state[chat_name] = current_ts
             continue
 
